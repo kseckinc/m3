@@ -1,4 +1,4 @@
-// +build integration_v2
+// +build test_harness
 // Copyright (c) 2021  Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -39,20 +39,20 @@ import (
 )
 
 func TestNewDBNodeNoSetup(t *testing.T) {
-	dbnode, err := NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{})
+	dbnode, err := NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{Start: true})
 	require.NoError(t, err)
 
 	require.NoError(t, dbnode.Close())
 
 	// Restart and shutdown again to test restarting
-	dbnode, err = NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{})
+	dbnode, err = NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{Start: true})
 	require.NoError(t, err)
 
 	require.NoError(t, dbnode.Close())
 }
 
 func TestDBNode(t *testing.T) {
-	dbnode, closer := setupNode(t)
+	dbnode, _, closer := setupNodeAndCoordinator(t)
 	defer closer()
 
 	testHealth(t, dbnode)
@@ -168,11 +168,14 @@ func validateTag(t *testing.T, tag ident.Tag, name string, value string) {
 	require.Equal(t, value, tag.Value.String())
 }
 
-func setupNode(t *testing.T) (resources.Node, func()) {
-	dbnode, err := NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{GenerateHostID: true})
+func setupNodeAndCoordinator(t *testing.T) (resources.Node, resources.Coordinator, func()) {
+	dbnode, err := NewDBNodeFromYAML(defaultDBNodeConfig, DBNodeOptions{
+		GenerateHostID: true,
+		Start:          true,
+	})
 	require.NoError(t, err)
 
-	coord, err := NewCoordinatorFromYAML(defaultCoordConfig, CoordinatorOptions{})
+	coord, err := NewCoordinatorFromYAML(defaultCoordConfig, CoordinatorOptions{Start: true})
 	require.NoError(t, err)
 
 	require.NoError(t, coord.WaitForNamespace(""))
@@ -190,9 +193,10 @@ func setupNode(t *testing.T) (resources.Node, func()) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, dbnode.WaitForBootstrap())
+	require.NoError(t, coord.WaitForShardsReady())
+	require.NoError(t, coord.WaitForClusterReady())
 
-	return dbnode, func() {
+	return dbnode, coord, func() {
 		assert.NoError(t, coord.Close())
 		assert.NoError(t, dbnode.Close())
 	}

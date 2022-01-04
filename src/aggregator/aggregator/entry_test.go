@@ -1073,6 +1073,110 @@ func TestAddUntimed_ResendEnabled(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestAddUntimed_ResendEnabledMigrationRace(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	e, _, _ := testEntry(ctrl, testEntryOptions{})
+	metadatas := metadata.StagedMetadatas{
+		{
+			Metadata: metadata.Metadata{
+				Pipelines: []metadata.PipelineMetadata{
+					{
+						AggregationID: aggregation.MustCompressTypes(aggregation.Sum),
+						ResendEnabled: false,
+						StoragePolicies: policy.StoragePolicies{
+							testStoragePolicy,
+						},
+					},
+				},
+			},
+		},
+	}
+	resolution := testStoragePolicy.Resolution().Window
+	mu := testGauge
+
+	// add value with resendEnable=false
+	require.NoError(t, e.addUntimed(mu, metadatas))
+	require.Len(t, e.aggregations, 1)
+	require.False(t, e.aggregations[0].resendEnabled)
+	elem := e.aggregations[0].elem.Value.(*GaugeElem)
+	vals := elem.values
+	require.Len(t, vals, 1)
+	t1 := xtime.ToUnixNano(e.nowFn().Truncate(resolution))
+	_, ok := vals[t1]
+	require.True(t, ok)
+
+	// consume the aggregation so it's closed
+	t2 := t1.Add(resolution)
+	require.False(t, consume(elem, t2))
+	require.True(t, vals[t1].lockedAgg.closed)
+
+	// add value with resendEnabled=true that targets the closed aggregation. it will automatically roll forward.
+	metadatas[0].Metadata.Pipelines[0].ResendEnabled = true
+	mu.ClientTimeNanos = t1
+	require.NoError(t, e.addUntimed(mu, metadatas))
+	require.Len(t, vals, 2)
+	_, ok = vals[t2]
+	require.True(t, ok)
+}
+
+func TestAddUntimed_ResendEnabledMigrationRaceWithFlusher(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	e, _, _ := testEntry(ctrl, testEntryOptions{})
+	metadatas := metadata.StagedMetadatas{
+		{
+			Metadata: metadata.Metadata{
+				Pipelines: []metadata.PipelineMetadata{
+					{
+						AggregationID: aggregation.MustCompressTypes(aggregation.Sum),
+						ResendEnabled: false,
+						StoragePolicies: policy.StoragePolicies{
+							testStoragePolicy,
+						},
+					},
+				},
+			},
+		},
+	}
+	resolution := testStoragePolicy.Resolution().Window
+	mu := testGauge
+
+	// add value with resendEnable=false
+	require.NoError(t, e.addUntimed(mu, metadatas))
+	require.Len(t, e.aggregations, 1)
+	require.False(t, e.aggregations[0].resendEnabled)
+	elem := e.aggregations[0].elem.Value.(*GaugeElem)
+	vals := elem.values
+	require.Len(t, vals, 1)
+	t1 := xtime.ToUnixNano(e.nowFn().Truncate(resolution))
+	_, ok := vals[t1]
+	require.True(t, ok)
+
+	t2 := t1.Add(resolution)
+	// partially consume the aggregation
+	elem.dirtyToConsumeWithLock(int64(t2), resolution, isStandardMetricEarlierThan)
+
+	// add value with resendEnabled=true that targets the aggregation being flushed
+	metadatas[0].Metadata.Pipelines[0].ResendEnabled = true
+	mu.ClientTimeNanos = t1
+	require.NoError(t, e.addUntimed(mu, metadatas))
+
+	// continue consuming the aggregation
+	elem.expireValuesWithLock(int64(t2), isStandardMetricEarlierThan, flushMetrics{})
+
+	// target the aggregation being flushed again...it should still be open since it migrated to resendEnabled before
+	// closing.
+	require.NoError(t, e.addUntimed(mu, metadatas))
+
+	require.Len(t, vals, 1)
+	v, ok := vals[t1]
+	require.True(t, ok)
+	require.False(t, v.lockedAgg.closed)
+}
+
 func TestAddUntimed_ClosedAggregation(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1364,6 +1468,7 @@ func TestEntryAddTimedEntryClosed(t *testing.T) {
 	require.Equal(t, errEntryClosed, e.AddTimed(testTimedMetric, testTimedMetadata))
 }
 
+//nolint: dupl
 func TestEntryAddTimedMetricTooLate(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1379,31 +1484,51 @@ func TestEntryAddTimedMetricTooLate(t *testing.T) {
 	e.opts = e.opts.SetBufferForPastTimedMetricFn(timedAggregationBufferPastFn)
 
 	inputs := []struct {
-		timeNanos     int64
-		storagePolicy policy.StoragePolicy
+		timeNanos       int64
+		storagePolicies policy.StoragePolicies
 	}{
 		{
-			timeNanos:     now.UnixNano() - 11*time.Second.Nanoseconds(),
-			storagePolicy: policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour),
+			timeNanos: now.UnixNano() - 11*time.Second.Nanoseconds(),
+			storagePolicies: policy.StoragePolicies{
+				policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour),
+				policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour*2),
+			},
 		},
 		{
-			timeNanos:     now.UnixNano() - 12*time.Second.Nanoseconds(),
-			storagePolicy: policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour),
+			timeNanos: now.UnixNano() - 12*time.Second.Nanoseconds(),
+			storagePolicies: policy.StoragePolicies{
+				policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour),
+				policy.NewStoragePolicy(10*time.Second, xtime.Second, time.Hour*2),
+			},
 		},
 		{
-			timeNanos:     now.UnixNano() - 61*time.Second.Nanoseconds(),
-			storagePolicy: policy.NewStoragePolicy(time.Minute, xtime.Minute, time.Hour),
+			timeNanos: now.UnixNano() - 61*time.Second.Nanoseconds(),
+			storagePolicies: policy.StoragePolicies{
+				policy.NewStoragePolicy(time.Minute, xtime.Minute, time.Hour),
+			},
 		},
 		{
-			timeNanos:     now.UnixNano() - 62*time.Second.Nanoseconds(),
-			storagePolicy: policy.NewStoragePolicy(time.Minute, xtime.Minute, time.Hour),
+			timeNanos: now.UnixNano() - 62*time.Second.Nanoseconds(),
+			storagePolicies: policy.StoragePolicies{
+				policy.NewStoragePolicy(time.Minute, xtime.Minute, time.Hour),
+			},
 		},
 	}
 
 	for i, input := range inputs {
 		metric := testTimedMetric
 		metric.TimeNanos = input.timeNanos
-		err := e.AddTimed(metric, metadata.TimedMetadata{StoragePolicy: input.storagePolicy})
+		err := e.AddTimedWithStagedMetadatas(metric, metadata.StagedMetadatas{
+			metadata.StagedMetadata{
+				Metadata: metadata.Metadata{
+					Pipelines: metadata.PipelineMetadatas{
+						metadata.PipelineMetadata{
+							StoragePolicies: input.storagePolicies,
+						},
+					},
+				},
+			},
+		})
 		if i%2 == 0 {
 			require.NoError(t, err)
 			for _, l := range e.lists.lists {
@@ -1412,7 +1537,6 @@ func TestEntryAddTimedMetricTooLate(t *testing.T) {
 		} else {
 			require.True(t, xerrors.IsInvalidParams(err))
 			require.True(t, xerrors.Is(err, errTooFarInThePast))
-			require.Equal(t, errTooFarInThePast, xerrors.InnerError(err))
 			require.True(t, strings.Contains(err.Error(), "datapoint for aggregation too far in past"))
 			require.True(t, strings.Contains(err.Error(), "timestamp="))
 			require.True(t, strings.Contains(err.Error(), "past_limit="))
@@ -2275,9 +2399,11 @@ func aggregationKeys(pipelines []metadata.PipelineMetadata) []aggregationKey {
 	return aggregationKeys[:curr]
 }
 
-type testPreProcessFn func(e *Entry, now *time.Time)
-type testElemValidateFn func(t *testing.T, elem *list.Element, alignedStart time.Time)
-type testPostProcessFn func(t *testing.T)
+type (
+	testPreProcessFn   func(e *Entry, now *time.Time)
+	testElemValidateFn func(t *testing.T, elem *list.Element, alignedStart time.Time)
+	testPostProcessFn  func(t *testing.T)
+)
 
 type testEntryData struct {
 	mu unaggregated.MetricUnion

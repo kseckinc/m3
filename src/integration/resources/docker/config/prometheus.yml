@@ -2,8 +2,8 @@
 global:
   external_labels:
     role: "remote"
-  scrape_interval:     15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
-  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  scrape_interval:     5s # Set the scrape interval to every 5 seconds. Default is every 1 minute.
+  evaluation_interval: 5s # Evaluate rules every 5 seconds. The default is every 1 minute.
   # scrape_timeout is set to the global default (10s).
 
 # Alertmanager configuration
@@ -32,17 +32,17 @@ scrape_configs:
 
   - job_name: 'coordinator'
     static_configs:
-      - targets: ['coordinator01:7203']
+      - targets: ['host.docker.internal:7203']
 
   - job_name: 'dbnode'
     static_configs:
-      - targets: ['dbnode01:9004']
+      - targets: ['host.docker.internal:9004']
 
 remote_read:
-  - url: http://coordinator01:7201/api/v1/prom/remote/read
+  - url: http://host.docker.internal:7201/api/v1/prom/remote/read
 
 remote_write:
-  - url: http://coordinator01:7201/api/v1/prom/remote/write
+  - url: http://host.docker.internal:7201/api/v1/prom/remote/write
     write_relabel_configs:
       - target_label: metrics_storage
         replacement: m3db_remote

@@ -28,6 +28,7 @@ import (
 	"context"
 	"reflect"
 
+	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/ts"
@@ -59,6 +60,20 @@ func (m *MockDownsamplerAndWriter) EXPECT() *MockDownsamplerAndWriterMockRecorde
 	return m.recorder
 }
 
+// Downsampler mocks base method.
+func (m *MockDownsamplerAndWriter) Downsampler() downsample.Downsampler {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Downsampler")
+	ret0, _ := ret[0].(downsample.Downsampler)
+	return ret0
+}
+
+// Downsampler indicates an expected call of Downsampler.
+func (mr *MockDownsamplerAndWriterMockRecorder) Downsampler() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Downsampler", reflect.TypeOf((*MockDownsamplerAndWriter)(nil).Downsampler))
+}
+
 // Storage mocks base method.
 func (m *MockDownsamplerAndWriter) Storage() storage.Storage {
 	m.ctrl.T.Helper()
@@ -74,17 +89,17 @@ func (mr *MockDownsamplerAndWriterMockRecorder) Storage() *gomock.Call {
 }
 
 // Write mocks base method.
-func (m *MockDownsamplerAndWriter) Write(arg0 context.Context, arg1 models.Tags, arg2 ts.Datapoints, arg3 time.Unit, arg4 []byte, arg5 WriteOptions) error {
+func (m *MockDownsamplerAndWriter) Write(arg0 context.Context, arg1 models.Tags, arg2 ts.Datapoints, arg3 time.Unit, arg4 []byte, arg5 WriteOptions, arg6 ts.SourceType) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Write", arg0, arg1, arg2, arg3, arg4, arg5)
+	ret := m.ctrl.Call(m, "Write", arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Write indicates an expected call of Write.
-func (mr *MockDownsamplerAndWriterMockRecorder) Write(arg0, arg1, arg2, arg3, arg4, arg5 interface{}) *gomock.Call {
+func (mr *MockDownsamplerAndWriterMockRecorder) Write(arg0, arg1, arg2, arg3, arg4, arg5, arg6 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Write", reflect.TypeOf((*MockDownsamplerAndWriter)(nil).Write), arg0, arg1, arg2, arg3, arg4, arg5)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Write", reflect.TypeOf((*MockDownsamplerAndWriter)(nil).Write), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
 // WriteBatch mocks base method.

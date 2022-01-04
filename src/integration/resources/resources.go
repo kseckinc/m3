@@ -89,18 +89,46 @@ func SetupCluster(
 	}
 
 	var (
-		aggDatabase = admin.DatabaseCreateRequest{
+		unaggDatabase = admin.DatabaseCreateRequest{
 			Type:              "cluster",
-			NamespaceName:     AggName,
+			NamespaceName:     UnaggName,
 			RetentionTime:     retention,
 			NumShards:         numShards,
 			ReplicationFactor: replicationFactor,
 			Hosts:             hosts,
 		}
 
-		unaggDatabase = admin.DatabaseCreateRequest{
-			NamespaceName: UnaggName,
-			RetentionTime: retention,
+		aggNamespace = admin.NamespaceAddRequest{
+			Name: AggName,
+			Options: &namespace.NamespaceOptions{
+				BootstrapEnabled:  true,
+				FlushEnabled:      true,
+				WritesToCommitLog: true,
+				CleanupEnabled:    true,
+				SnapshotEnabled:   true,
+				IndexOptions: &namespace.IndexOptions{
+					Enabled:        true,
+					BlockSizeNanos: int64(30 * time.Minute),
+				},
+				RetentionOptions: &namespace.RetentionOptions{
+					RetentionPeriodNanos:                     int64(6 * time.Hour),
+					BlockSizeNanos:                           int64(30 * time.Minute),
+					BufferFutureNanos:                        int64(2 * time.Minute),
+					BufferPastNanos:                          int64(10 * time.Minute),
+					BlockDataExpiry:                          true,
+					BlockDataExpiryAfterNotAccessPeriodNanos: int64(time.Minute * 5),
+				},
+				AggregationOptions: &namespace.AggregationOptions{
+					Aggregations: []*namespace.Aggregation{
+						{
+							Aggregated: true,
+							Attributes: &namespace.AggregatedAttributes{
+								ResolutionNanos: int64(5 * time.Second),
+							},
+						},
+					},
+				},
+			},
 		}
 
 		coldWriteNamespace = admin.NamespaceAddRequest{
@@ -131,8 +159,8 @@ func SetupCluster(
 		return err
 	}
 
-	logger.Info("creating database", zap.Any("request", aggDatabase))
-	if _, err := coordinator.CreateDatabase(aggDatabase); err != nil {
+	logger.Info("creating database", zap.Any("request", unaggDatabase))
+	if _, err := coordinator.CreateDatabase(unaggDatabase); err != nil {
 		return err
 	}
 
@@ -141,18 +169,18 @@ func SetupCluster(
 		return err
 	}
 
-	logger.Info("waiting for namespace", zap.String("name", AggName))
-	if err := coordinator.WaitForNamespace(AggName); err != nil {
-		return err
-	}
-
-	logger.Info("creating namespace", zap.Any("request", unaggDatabase))
-	if _, err := coordinator.CreateDatabase(unaggDatabase); err != nil {
-		return err
-	}
-
 	logger.Info("waiting for namespace", zap.String("name", UnaggName))
 	if err := coordinator.WaitForNamespace(UnaggName); err != nil {
+		return err
+	}
+
+	logger.Info("creating namespace", zap.Any("request", aggNamespace))
+	if _, err := coordinator.AddNamespace(aggNamespace); err != nil {
+		return err
+	}
+
+	logger.Info("waiting for namespace", zap.String("name", AggName))
+	if err := coordinator.WaitForNamespace(AggName); err != nil {
 		return err
 	}
 
@@ -162,7 +190,7 @@ func SetupCluster(
 	}
 
 	logger.Info("waiting for namespace", zap.String("name", ColdWriteNsName))
-	if err := coordinator.WaitForNamespace(UnaggName); err != nil {
+	if err := coordinator.WaitForNamespace(ColdWriteNsName); err != nil {
 		return err
 	}
 
@@ -187,23 +215,6 @@ func SetupCluster(
 			return errors.New("no aggregators have been initiazted")
 		}
 
-		if err := setupPlacement(coordinator, aggregators, *opts.Aggregator); err != nil {
-			return err
-		}
-
-		aggInstanceInfo, err := aggregators[0].HostDetails()
-		if err != nil {
-			return err
-		}
-
-		if err := setupM3msgTopics(coordinator, *aggInstanceInfo, opts); err != nil {
-			return err
-		}
-
-		for _, agg := range aggregators {
-			agg.Start()
-		}
-
 		if err := aggregators.WaitForHealthy(); err != nil {
 			return err
 		}
@@ -214,8 +225,11 @@ func SetupCluster(
 	return nil
 }
 
-func setupPlacement(
-	coordinator Coordinator,
+// SetupPlacement configures the placement for the provided coordinators
+// and aggregators.
+func SetupPlacement(
+	coordAPI Coordinator,
+	coordHost InstanceInfo,
 	aggs Aggregators,
 	opts AggregatorClusterOptions,
 ) error {
@@ -252,12 +266,15 @@ func setupPlacement(
 		Env:     env,
 	}
 
-	_, err := coordinator.InitPlacement(
+	_, err := coordAPI.InitPlacement(
 		aggPlacementRequestOptions,
 		admin.PlacementInitRequest{
 			NumShards:         opts.NumShards,
 			ReplicationFactor: opts.RF,
 			Instances:         instances,
+			OptionOverride: &placementpb.Options{
+				SkipPortMirroring: &protobuftypes.BoolValue{Value: true},
+			},
 		},
 	)
 	if err != nil {
@@ -265,17 +282,12 @@ func setupPlacement(
 	}
 
 	// Setup coordinator placement.
-	coordHost, err := coordinator.HostDetails()
-	if err != nil {
-		return fmt.Errorf("failed to get coordinator host details: %w", err)
-	}
-
 	coordPlacementRequestOptions := PlacementRequestOptions{
 		Service: ServiceTypeM3Coordinator,
 		Zone:    coordHost.Zone,
 		Env:     coordHost.Env,
 	}
-	_, err = coordinator.InitPlacement(
+	_, err = coordAPI.InitPlacement(
 		coordPlacementRequestOptions,
 		admin.PlacementInitRequest{
 			Instances: []*placementpb.Instance{
@@ -296,7 +308,9 @@ func setupPlacement(
 	return nil
 }
 
-func setupM3msgTopics(
+// SetupM3MsgTopics sets up the m3msg topics for the provided coordinator
+// and aggregator.
+func SetupM3MsgTopics(
 	coord Coordinator,
 	aggInstanceInfo InstanceInfo,
 	opts ClusterOptions,

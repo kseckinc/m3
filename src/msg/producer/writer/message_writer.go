@@ -27,19 +27,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/uber-go/tally"
+
 	"github.com/m3db/m3/src/msg/producer"
 	"github.com/m3db/m3/src/msg/protocol/proto"
 	"github.com/m3db/m3/src/x/clock"
 	"github.com/m3db/m3/src/x/instrument"
 	"github.com/m3db/m3/src/x/retry"
 	"github.com/m3db/m3/src/x/unsafe"
-
-	"github.com/uber-go/tally"
 )
 
+// MessageRetryNanosFn returns the message backoff time for retry in nanoseconds.
+type MessageRetryNanosFn func(writeTimes int) int64
+
 var (
-	errFailAllConsumers = errors.New("could not write to any consumer")
-	errNoWriters        = errors.New("no writers")
+	errInvalidBackoffDuration = errors.New("invalid backoff duration")
+	errFailAllConsumers       = errors.New("could not write to any consumer")
+	errNoWriters              = errors.New("no writers")
 )
 
 const _recordMessageDelayEvery = 4 // keep it a power of two value to keep modulo fast
@@ -211,7 +215,7 @@ type messageWriterImpl struct {
 	replicatedShardID   uint64
 	mPool               messagePool
 	opts                Options
-	nextRetryAfterNanos func(int) int64
+	nextRetryAfterNanos MessageRetryNanosFn
 	encoder             proto.Encoder
 	numConnections      int
 
@@ -249,7 +253,7 @@ func newMessageWriter(
 		replicatedShardID:   replicatedShardID,
 		mPool:               mPool,
 		opts:                opts,
-		nextRetryAfterNanos: nextRetryNanosFn(opts.MessageRetryOptions()),
+		nextRetryAfterNanos: opts.MessageRetryNanosFn(),
 		encoder:             proto.NewEncoder(opts.EncoderOptions()),
 		numConnections:      opts.ConnectionOptions().NumConnections(),
 		msgID:               0,
@@ -279,8 +283,10 @@ func (w *messageWriterImpl) Write(rm *producer.RefCountedMessage) {
 	rm.IncRef()
 	w.msgID++
 	meta := metadata{
-		shard: w.replicatedShardID,
-		id:    w.msgID,
+		metadataKey: metadataKey{
+			shard: w.replicatedShardID,
+			id:    w.msgID,
+		},
 	}
 	msg.Set(meta, rm, nowNanos)
 	w.acks.add(meta, msg)
@@ -318,6 +324,7 @@ func (w *messageWriterImpl) write(
 	m *message,
 ) error {
 	m.IncReads()
+	m.SetSentAt(w.nowFn().UnixNano())
 	msg, isValid := m.Marshaler()
 	if !isValid {
 		m.DecReads()
@@ -726,25 +733,25 @@ func (w *messageWriterImpl) close(m *message) {
 type acks struct {
 	sync.Mutex
 
-	ackMap map[metadata]*message
+	ackMap map[metadataKey]*message
 }
 
 // nolint: unparam
 func newAckHelper(size int) *acks {
 	return &acks{
-		ackMap: make(map[metadata]*message, size),
+		ackMap: make(map[metadataKey]*message, size),
 	}
 }
 
 func (a *acks) add(meta metadata, m *message) {
 	a.Lock()
-	a.ackMap[meta] = m
+	a.ackMap[meta.metadataKey] = m
 	a.Unlock()
 }
 
 func (a *acks) remove(meta metadata) {
 	a.Lock()
-	delete(a.ackMap, meta)
+	delete(a.ackMap, meta.metadataKey)
 	a.Unlock()
 }
 
@@ -752,13 +759,13 @@ func (a *acks) remove(meta metadata) {
 // processing time for lag calculations.
 func (a *acks) ack(meta metadata) (bool, int64) {
 	a.Lock()
-	m, ok := a.ackMap[meta]
+	m, ok := a.ackMap[meta.metadataKey]
 	if !ok {
 		a.Unlock()
 		// Acking a message that is already acked, which is ok.
 		return false, 0
 	}
-	delete(a.ackMap, meta)
+	delete(a.ackMap, meta.metadataKey)
 	a.Unlock()
 	expectedProcessAtNanos := m.ExpectedProcessAtNanos()
 	m.Ack()
@@ -809,7 +816,8 @@ func (m *scanBatchMetrics) recordNonzeroCounter(idx metricIdx, c tally.Counter) 
 	}
 }
 
-func nextRetryNanosFn(retryOpts retry.Options) func(int) int64 {
+// NextRetryNanosFn creates a MessageRetryNanosFn based on the retry options.
+func NextRetryNanosFn(retryOpts retry.Options) func(int) int64 {
 	var (
 		jitter              = retryOpts.Jitter()
 		backoffFactor       = retryOpts.BackoffFactor()
@@ -842,4 +850,23 @@ func nextRetryNanosFn(retryOpts retry.Options) func(int) int64 {
 		}
 		return backoff
 	}
+}
+
+// StaticRetryNanosFn creates a MessageRetryNanosFn based on static config.
+func StaticRetryNanosFn(backoffDurations []time.Duration) (MessageRetryNanosFn, error) {
+	if len(backoffDurations) == 0 {
+		return nil, errInvalidBackoffDuration
+	}
+	backoffInt64s := make([]int64, 0, len(backoffDurations))
+	for _, b := range backoffDurations {
+		backoffInt64s = append(backoffInt64s, int64(b))
+	}
+	return func(writeTimes int) int64 {
+		retry := writeTimes - 1
+		l := len(backoffInt64s)
+		if retry < l {
+			return backoffInt64s[retry]
+		}
+		return backoffInt64s[l-1]
+	}, nil
 }

@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uber-go/tally"
 	"github.com/willf/bitset"
 	"go.uber.org/atomic"
 
@@ -684,6 +685,8 @@ func TestCounterElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	require.False(t, e.Consume(ts, isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
 	verifyForwardedMetrics(t, expectedForwardedRes, *forwardRes)
+	expectedOnFlushedRes[0].expiredTimes = append(expectedOnFlushedRes[0].expiredTimes,
+		xtime.ToUnixNano(time.Unix(220, 0)), xtime.ToUnixNano(time.Unix(230, 0)))
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 1, len(e.values))
@@ -700,6 +703,7 @@ func TestCounterElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	onForwardedFlushedFn, onForwardedFlushedRes = testOnForwardedFlushedFn()
 	require.True(t, e.Consume(alignedstartAtNanos[3], isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
+	expectedOnFlushedRes[0].expiredTimes = nil
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 0, len(*forwardRes))
@@ -1221,6 +1225,8 @@ func TestTimerElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	require.False(t, e.Consume(alignedstartAtNanos[3], isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
 	verifyForwardedMetrics(t, expectedForwardedRes, *forwardRes)
+	expectedOnFlushedRes[0].expiredTimes = append(expectedOnFlushedRes[0].expiredTimes,
+		xtime.ToUnixNano(time.Unix(220, 0)), xtime.ToUnixNano(time.Unix(230, 0)))
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 1, len(e.values))
@@ -1237,6 +1243,7 @@ func TestTimerElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	onForwardedFlushedFn, onForwardedFlushedRes = testOnForwardedFlushedFn()
 	require.True(t, e.Consume(alignedstartAtNanos[3], isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
+	expectedOnFlushedRes[0].expiredTimes = nil
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 0, len(*forwardRes))
@@ -1966,6 +1973,8 @@ func TestGaugeElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	require.False(t, e.Consume(alignedstartAtNanos[3], isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
 	verifyForwardedMetrics(t, expectedForwardedRes, *forwardRes)
+	expectedOnFlushedRes[0].expiredTimes = append(expectedOnFlushedRes[0].expiredTimes,
+		xtime.ToUnixNano(time.Unix(220, 0)), xtime.ToUnixNano(time.Unix(230, 0)))
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 1, len(e.values))
@@ -1982,6 +1991,7 @@ func TestGaugeElemConsumeCustomAggregationCustomPipeline(t *testing.T) {
 	onForwardedFlushedFn, onForwardedFlushedRes = testOnForwardedFlushedFn()
 	require.True(t, e.Consume(alignedstartAtNanos[3], isEarlierThanFn, timestampNanosFn, standardMetricTargetNanos,
 		localFn, forwardFn, onForwardedFlushedFn, 0, consumeType))
+	expectedOnFlushedRes[0].expiredTimes = nil
 	verifyOnForwardedFlushResult(t, expectedOnFlushedRes, *onForwardedFlushedRes)
 	require.Equal(t, 0, len(*localRes))
 	require.Equal(t, 0, len(*forwardRes))
@@ -2499,7 +2509,7 @@ func TestPanics(t *testing.T) {
 					localFn,
 					forwardFn,
 					0, 0, 0,
-					consumeType)
+					newFlushMetrics(tally.NewTestScope("", nil)))
 			},
 		},
 		{
@@ -2533,7 +2543,7 @@ func TestPanics(t *testing.T) {
 					localFn,
 					forwardFn,
 					0, 0, 0,
-					consumeType)
+					newFlushMetrics(tally.NewTestScope("", nil)))
 			},
 		},
 	}
@@ -2899,14 +2909,17 @@ func TestExpireValues(t *testing.T) {
 
 			// Add test values.
 			for _, v := range test.values {
-				_, err := e.findOrCreate(int64(v), createAggregationOptions{
-					resendEnabled: test.resendEnabled,
-				})
+				a, err := e.findOrCreate(int64(v), createAggregationOptions{})
+				a.resendEnabled = test.resendEnabled
+				// need to manually seed the flush state since we don't call Consume(), which takes care of setting
+				// the flush state for expireValuesWithLock to use.
+				e.flushState[v] = flushState{latestResendEnabled: test.resendEnabled}
 				require.NoError(t, err)
 			}
 
 			// Expire up to target.
-			e.expireValuesWithLock(int64(test.targetNanos), isStandardMetricEarlierThan)
+			e.expireValuesWithLock(int64(test.targetNanos), isStandardMetricEarlierThan,
+				newFlushMetrics(tally.NewTestScope("", nil)))
 
 			// Validate toExpire and remaining values.
 			require.Equal(t, len(test.expectedToExpire), len(e.flushStateToExpire))
@@ -2949,6 +2962,7 @@ type testForwardedMetricWithMetadata struct {
 
 type testOnForwardedFlushedData struct {
 	aggregationKey aggregationKey
+	expiredTimes   []xtime.UnixNano
 }
 
 func testFlushLocalMetricFn() (
@@ -3010,6 +3024,7 @@ func testOnForwardedFlushedFn() (
 	) {
 		result = append(result, testOnForwardedFlushedData{
 			aggregationKey: aggregationKey,
+			expiredTimes:   expiredTimes,
 		})
 	}, &result
 }
@@ -3105,17 +3120,17 @@ func testGaugeElemWithData(
 	require.NoError(t, e.ResetSetData(data))
 	for i, aligned := range alignedstartAtNanos {
 		gauge := &lockedGaugeAggregation{
-			aggregation: newGaugeAggregation(raggregation.NewGauge(e.aggOpts)),
-			sourcesSeen: make(map[uint32]*bitset.BitSet),
+			aggregation:   newGaugeAggregation(raggregation.NewGauge(e.aggOpts)),
+			sourcesSeen:   make(map[uint32]*bitset.BitSet),
+			resendEnabled: resendEnabled,
 		}
 		gauge.dirty = true
 		// offset the timestamp by 1 so the gauge value can be updated using the aligned timestamp later.
 		gauge.aggregation.Update(time.Unix(0, aligned-1), gaugeVals[i], nil)
 		startAligned := xtime.UnixNano(aligned)
 		e.values[startAligned] = timedGauge{
-			startAt:       startAligned,
-			lockedAgg:     gauge,
-			resendEnabled: resendEnabled,
+			startAt:   startAligned,
+			lockedAgg: gauge,
 		}
 		e.dirty = append(e.dirty, startAligned)
 	}
@@ -3275,5 +3290,9 @@ func verifyOnForwardedFlushResult(t *testing.T, expected, actual []testOnForward
 	require.Equal(t, len(expected), len(actual))
 	for i := 0; i < len(expected); i++ {
 		require.True(t, expected[i].aggregationKey.Equal(actual[i].aggregationKey))
+		require.Equal(t, len(expected[i].expiredTimes), len(actual[i].expiredTimes))
+		for j := 0; j < len(expected[i].expiredTimes); j++ {
+			require.Equal(t, expected[i].expiredTimes[j], actual[i].expiredTimes[j])
+		}
 	}
 }

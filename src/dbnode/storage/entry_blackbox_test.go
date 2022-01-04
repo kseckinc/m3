@@ -21,6 +21,7 @@
 package storage
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -29,9 +30,12 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uber-go/tally"
 
 	"github.com/m3db/m3/src/dbnode/storage/series"
+	"github.com/m3db/m3/src/m3ninx/doc"
 	"github.com/m3db/m3/src/x/ident"
+	"github.com/m3db/m3/src/x/tallytest"
 	xtest "github.com/m3db/m3/src/x/test"
 	xtime "github.com/m3db/m3/src/x/time"
 )
@@ -47,9 +51,12 @@ func newTime(n int) xtime.UnixNano {
 }
 
 func newMockSeries(ctrl *gomock.Controller) series.DatabaseSeries {
-	id := ident.StringID("foo")
+	return newMockSeriesWithID(ctrl, "foo")
+}
+
+func newMockSeriesWithID(ctrl *gomock.Controller, id string) series.DatabaseSeries {
 	series := series.NewMockDatabaseSeries(ctrl)
-	series.EXPECT().ID().Return(id).AnyTimes()
+	series.EXPECT().ID().Return(ident.StringID(id)).AnyTimes()
 	return series
 }
 
@@ -245,5 +252,213 @@ func TestReconciledOnIndexSeries(t *testing.T) {
 	e, closer, reconciled = entry.ReconciledOnIndexSeries()
 	require.False(t, reconciled)
 	require.Equal(t, uint64(0), e.(*Entry).Index)
+	closer.Close()
+}
+
+func TestMergeWithIndexSeries(t *testing.T) {
+	ctrl := xtest.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		blockSize  = time.Hour * 2
+		numBlocks  = 5
+		numEntries = 3
+		start      = xtime.Now().
+				Truncate(blockSize).
+				Add(blockSize * -time.Duration(numEntries*numBlocks)) //nolint: durationcheck
+
+		expectedIndexTimes = make([]xtime.UnixNano, 0, numEntries*numBlocks)
+		entries            = make([]*Entry, 0, numEntries)
+	)
+
+	for entryIdx := 0; entryIdx < numEntries; entryIdx++ {
+		series := newMockSeriesWithID(ctrl, fmt.Sprint("bar", entryIdx))
+		entry := NewEntry(NewEntryOptions{Series: series})
+
+		for blockIdx := 0; blockIdx < numBlocks; blockIdx++ {
+			blockStart := start.
+				Add(blockSize * time.Duration(blockIdx+numBlocks*entryIdx))
+
+			expectedIndexTimes = append(expectedIndexTimes, blockStart)
+			entry.OnIndexSuccess(blockStart)
+		}
+
+		entries = append(entries, entry)
+	}
+
+	mergedEntry := NewEntry(NewEntryOptions{Series: newMockSeries(ctrl)})
+	for _, entry := range entries {
+		mergedEntry.MergeEntryIndexBlockStates(entry.reverseIndex.states)
+	}
+
+	for _, start := range expectedIndexTimes {
+		require.True(t, mergedEntry.IndexedForBlockStart(start))
+	}
+
+	min, max := mergedEntry.IndexedRange()
+	require.Equal(t, min, start)
+	require.Equal(t, max, start.Add(blockSize*time.Duration(numEntries*numBlocks-1)))
+}
+
+func TestEntryTryMarkIndexGarbageCollected(t *testing.T) {
+	ctrl := xtest.NewController(t)
+	defer ctrl.Finish()
+
+	opts := DefaultTestOptions()
+	ctx := opts.ContextPool().Get()
+	defer ctx.Close()
+
+	shard := testDatabaseShard(t, opts)
+	defer func() {
+		require.NoError(t, shard.Close())
+	}()
+
+	// Create entry with index 0 that's not inserted
+	s := series.NewMockDatabaseSeries(ctrl)
+	s.EXPECT().ID().Return(id).AnyTimes()
+	s.EXPECT().Close().Return()
+
+	scope := tally.NewTestScope("test", nil)
+	metrics := NewEntryMetrics(scope)
+	uncommittedEntry := NewEntry(NewEntryOptions{
+		Index:        0,
+		Shard:        shard,
+		Series:       s,
+		EntryMetrics: metrics,
+	})
+	committedEntry := NewEntry(NewEntryOptions{
+		Index:        1,
+		Shard:        shard,
+		Series:       s,
+		EntryMetrics: metrics,
+	})
+	shard.Lock()
+	shard.insertNewShardEntryWithLock(committedEntry)
+	shard.Unlock()
+
+	// reconciled := scope.Counter("reconciled")
+	// unreconciled := scope.Counter("unreconciled")
+
+	// Not eligible if not empty.
+	s.EXPECT().IsEmpty().Return(false)
+	collected := uncommittedEntry.TryMarkIndexGarbageCollected()
+	require.False(t, collected)
+
+	// Not eligible if held.
+	s.EXPECT().IsEmpty().Return(true).AnyTimes()
+	committedEntry.IncrementReaderWriterCount()
+	collected = uncommittedEntry.TryMarkIndexGarbageCollected()
+	require.False(t, collected)
+
+	committedEntry.DecrementReaderWriterCount()
+	collected = uncommittedEntry.TryMarkIndexGarbageCollected()
+	require.True(t, collected)
+
+	tallytest.AssertCounterValue(t, 1, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "needs_reconcile",
+		"path":      "gc",
+	})
+	tallytest.AssertCounterValue(t, 0, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "no_reconcile",
+		"path":      "gc",
+	})
+
+	// Entry in the shard is the one marked for GC (not the one necessarily used for the call above).
+	require.True(t, committedEntry.IndexGarbageCollected.Load())
+	require.False(t, uncommittedEntry.IndexGarbageCollected.Load())
+}
+
+func TestTryReconcileDuplicates(t *testing.T) {
+	ctrl := xtest.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		shard  = NewMockShard(ctrl)
+		scope  = tally.NewTestScope("test", nil)
+		series = series.NewMockDatabaseSeries(ctrl)
+	)
+
+	series.EXPECT().ID().Return(id)
+	entry := NewEntry(NewEntryOptions{
+		Series:       series,
+		Shard:        shard,
+		EntryMetrics: NewEntryMetrics(scope),
+	})
+
+	shard.EXPECT().TryRetrieveSeriesAndIncrementReaderWriterCount(id).DoAndReturn(
+		func(ident.ID) (*Entry, WritableSeriesOptions, error) {
+			// NB: TryRetrieveSeriesAndIncrementReaderWriterCount increments rw count
+			// so emulate this here.
+			entry.IncrementReaderWriterCount()
+			return entry, WritableSeriesOptions{}, nil
+		})
+
+	entry.TryReconcileDuplicates()
+	tallytest.AssertCounterValue(t, 1, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "no_reconcile",
+		"path":      "duplicate",
+	})
+	tallytest.AssertCounterValue(t, 0, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "needs_reconcile",
+		"path":      "duplicate",
+	})
+
+	states := doc.EntryIndexBlockStates{1: doc.EntryIndexBlockState{}}
+	entry.reverseIndex = entryIndexState{states: states}
+	e := &Entry{reverseIndex: newEntryIndexState()}
+	shard.EXPECT().TryRetrieveSeriesAndIncrementReaderWriterCount(id).
+		Return(e, WritableSeriesOptions{}, nil)
+
+	entry.TryReconcileDuplicates()
+	require.Equal(t, states, e.reverseIndex.states)
+	tallytest.AssertCounterValue(t, 1, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "no_reconcile",
+		"path":      "duplicate",
+	})
+	tallytest.AssertCounterValue(t, 1, scope.Snapshot(), "test.count", map[string]string{
+		"reconcile": "needs_reconcile",
+		"path":      "duplicate",
+	})
+}
+
+func TestMergeOnReconcile(t *testing.T) {
+	ctrl := xtest.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		shard  = NewMockShard(ctrl)
+		series = series.NewMockDatabaseSeries(ctrl)
+	)
+
+	series.EXPECT().ID().Return(id)
+	entry := NewEntry(NewEntryOptions{
+		Series: series,
+		Shard:  shard,
+	})
+
+	shard.EXPECT().TryRetrieveSeriesAndIncrementReaderWriterCount(id).DoAndReturn(
+		func(ident.ID) (*Entry, WritableSeriesOptions, error) {
+			// NB: TryRetrieveSeriesAndIncrementReaderWriterCount increments rw count
+			// so emulate this here.
+			entry.IncrementReaderWriterCount()
+			return entry, WritableSeriesOptions{}, nil
+		})
+
+	onIndexed, closer, needsReconcile := entry.ReconciledOnIndexSeries()
+	require.Equal(t, entry, onIndexed)
+	require.True(t, needsReconcile)
+	closer.Close()
+
+	states := doc.EntryIndexBlockStates{1: doc.EntryIndexBlockState{}}
+	entry.reverseIndex = entryIndexState{states: states}
+	otherEntry := &Entry{reverseIndex: newEntryIndexState()}
+	shard.EXPECT().TryRetrieveSeriesAndIncrementReaderWriterCount(id).
+		Return(otherEntry, WritableSeriesOptions{}, nil)
+
+	onIndexed, closer, needsReconcile = entry.ReconciledOnIndexSeries()
+	require.True(t, needsReconcile)
+	e, ok := onIndexed.(*Entry)
+	require.True(t, ok)
+	require.Equal(t, states, e.reverseIndex.states)
 	closer.Close()
 }

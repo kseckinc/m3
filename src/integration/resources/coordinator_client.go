@@ -29,6 +29,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -41,7 +42,10 @@ import (
 
 	"github.com/m3db/m3/src/cluster/generated/proto/placementpb"
 	"github.com/m3db/m3/src/cluster/placementhandler"
+	"github.com/m3db/m3/src/query/api/v1/handler/graphite"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/native"
 	"github.com/m3db/m3/src/query/api/v1/handler/topic"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/api/v1/route"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
@@ -230,17 +234,10 @@ func (c *CoordinatorClient) WaitForNamespace(name string) error {
 		}
 
 		nss := ns.GetRegistry().GetNamespaces()
-		namespace, found := nss[name]
+		_, found := nss[name]
 		if !found {
 			err := fmt.Errorf("no namespace with name %s", name)
 			logger.Error("could not get namespace", zap.Error(err))
-			return err
-		}
-
-		enabled := namespace.GetIndexOptions().GetEnabled()
-		if !enabled {
-			err := fmt.Errorf("namespace %s not enabled", name)
-			logger.Error("namespace not enabled", zap.Error(err))
 			return err
 		}
 
@@ -324,7 +321,22 @@ func (c *CoordinatorClient) WaitForClusterReady() error {
 			logger.Error("failed checking cluster readiness", zap.Error(err))
 			return err
 		}
-		resp.Body.Close()
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			err = errors.New("non-200 status code received")
+
+			body, rerr := ioutil.ReadAll(resp.Body)
+			if rerr != nil {
+				logger.Warn("failed parse response body", zap.Error(rerr))
+				body = []byte("")
+			}
+
+			logger.Error("failed to check cluster readiness", zap.Error(err),
+				zap.String("responseBody", string(body)),
+			)
+			return err
+		}
 
 		logger.Info("cluster ready to receive reads and writes")
 
@@ -572,27 +584,43 @@ func (c *CoordinatorClient) WriteCarbon(
 	return con.Close()
 }
 
-// WriteProm writes a prometheus metric.
-func (c *CoordinatorClient) WriteProm(name string, tags map[string]string, samples []prompb.Sample) error {
-	var (
-		url       = c.makeURL("api/v1/prom/remote/write")
-		reqLabels = []prompb.Label{{Name: []byte(model.MetricNameLabel), Value: []byte(name)}}
-	)
+// WriteProm writes a prometheus metric. Takes tags/labels as a map for convenience.
+func (c *CoordinatorClient) WriteProm(
+	name string,
+	tags map[string]string,
+	samples []prompb.Sample,
+	headers Headers,
+) error {
+	labels := make([]prompb.Label, 0, len(tags)+1)
+
+	labels = append(labels, prompb.Label{
+		Name:  []byte(model.MetricNameLabel),
+		Value: []byte(name),
+	})
 
 	for tag, value := range tags {
-		reqLabels = append(reqLabels, prompb.Label{
+		labels = append(labels, prompb.Label{
 			Name:  []byte(tag),
 			Value: []byte(value),
 		})
 	}
+
 	writeRequest := prompb.WriteRequest{
 		Timeseries: []prompb.TimeSeries{
 			{
-				Labels:  reqLabels,
+				Labels:  labels,
 				Samples: samples,
 			},
 		},
 	}
+
+	return c.WritePromWithRequest(writeRequest, headers)
+}
+
+// WritePromWithRequest executes a prometheus write request. Allows you to
+// provide the request directly which is useful for batch metric requests.
+func (c *CoordinatorClient) WritePromWithRequest(writeRequest prompb.WriteRequest, headers Headers) error {
+	url := c.makeURL("api/v1/prom/remote/write")
 
 	logger := c.logger.With(
 		ZapMethod("writeProm"), zap.String("url", url),
@@ -609,6 +637,11 @@ func (c *CoordinatorClient) WriteProm(name string, tags map[string]string, sampl
 	if err != nil {
 		logger.Error("failed constructing request", zap.Error(err))
 		return err
+	}
+	for key, vals := range headers {
+		for _, val := range vals {
+			req.Header.Add(key, val)
+		}
 	}
 	req.Header.Add(xhttp.HeaderContentType, xhttp.ContentTypeProtobuf)
 
@@ -722,8 +755,31 @@ func (c *CoordinatorClient) query(
 }
 
 // InstantQuery runs an instant query with provided headers
-func (c *CoordinatorClient) InstantQuery(req QueryRequest, headers map[string][]string) (model.Vector, error) {
-	queryStr := fmt.Sprintf("%s?query=%s", route.QueryURL, req.QueryExpr)
+func (c *CoordinatorClient) InstantQuery(req QueryRequest, headers Headers) (model.Vector, error) {
+	return c.instantQuery(req, route.QueryURL, headers)
+}
+
+// InstantQueryWithEngine runs an instant query with provided headers and the specified
+// query engine.
+func (c *CoordinatorClient) InstantQueryWithEngine(
+	req QueryRequest,
+	engine options.QueryEngine,
+	headers Headers,
+) (model.Vector, error) {
+	if engine == options.M3QueryEngine {
+		return c.instantQuery(req, native.M3QueryReadInstantURL, headers)
+	} else if engine == options.PrometheusEngine {
+		return c.instantQuery(req, native.PrometheusReadInstantURL, headers)
+	}
+	return nil, fmt.Errorf("unknown query engine: %s", engine)
+}
+
+func (c *CoordinatorClient) instantQuery(
+	req QueryRequest,
+	queryRoute string,
+	headers Headers,
+) (model.Vector, error) {
+	queryStr := fmt.Sprintf("%s?query=%s", queryRoute, req.Query)
 	if req.Time != nil {
 		queryStr = fmt.Sprintf("%s&time=%d", queryStr, req.Time.Unix())
 	}
@@ -752,21 +808,41 @@ type vectorResult struct {
 }
 
 // RangeQuery runs a range query with provided headers
-func (c *CoordinatorClient) RangeQuery(req RangeQueryRequest, headers map[string][]string) (model.Matrix, error) {
-	if req.StartTime.IsZero() {
-		req.StartTime = time.Now()
+func (c *CoordinatorClient) RangeQuery(
+	req RangeQueryRequest,
+	headers Headers,
+) (model.Matrix, error) {
+	return c.rangeQuery(req, route.QueryRangeURL, headers)
+}
+
+// RangeQueryWithEngine runs a range query with provided headers and the specified
+// query engine.
+func (c *CoordinatorClient) RangeQueryWithEngine(
+	req RangeQueryRequest,
+	engine options.QueryEngine,
+	headers Headers,
+) (model.Matrix, error) {
+	if engine == options.M3QueryEngine {
+		return c.rangeQuery(req, native.M3QueryReadURL, headers)
+	} else if engine == options.PrometheusEngine {
+		return c.rangeQuery(req, native.PrometheusReadURL, headers)
 	}
-	if req.EndTime.IsZero() {
-		req.EndTime = time.Now()
-	}
+	return nil, fmt.Errorf("unknown query engine: %s", engine)
+}
+
+func (c *CoordinatorClient) rangeQuery(
+	req RangeQueryRequest,
+	queryRoute string,
+	headers Headers,
+) (model.Matrix, error) {
 	if req.Step == 0 {
 		req.Step = 15 * time.Second // default step is 15 seconds.
 	}
 	queryStr := fmt.Sprintf(
 		"%s?query=%s&start=%d&end=%d&step=%f",
-		route.QueryRangeURL, req.QueryExpr,
-		req.StartTime.Unix(),
-		req.EndTime.Unix(),
+		queryRoute, req.Query,
+		req.Start.Unix(),
+		req.End.Unix(),
 		req.Step.Seconds(),
 	)
 
@@ -783,6 +859,84 @@ func (c *CoordinatorClient) RangeQuery(req RangeQueryRequest, headers map[string
 	return parsedResp.Data.Result, nil
 }
 
+// LabelNames return matching label names based on the request.
+func (c *CoordinatorClient) LabelNames(
+	req LabelNamesRequest,
+	headers Headers,
+) (model.LabelNames, error) {
+	urlPathAndQuery := fmt.Sprintf("%s?%s", route.LabelNamesURL, req.String())
+	resp, err := c.runQuery(urlPathAndQuery, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsedResp labelResponse
+	if err := json.Unmarshal([]byte(resp), &parsedResp); err != nil {
+		return nil, err
+	}
+
+	labelNames := make(model.LabelNames, 0, len(parsedResp.Data))
+	for _, label := range parsedResp.Data {
+		labelNames = append(labelNames, model.LabelName(label))
+	}
+
+	return labelNames, nil
+}
+
+// LabelValues return matching label values based on the request.
+func (c *CoordinatorClient) LabelValues(
+	req LabelValuesRequest,
+	headers Headers,
+) (model.LabelValues, error) {
+	urlPathAndQuery := fmt.Sprintf("%s?%s",
+		path.Join(route.Prefix, "label", req.LabelName, "values"),
+		req.String())
+	resp, err := c.runQuery(urlPathAndQuery, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsedResp labelResponse
+	if err := json.Unmarshal([]byte(resp), &parsedResp); err != nil {
+		return nil, err
+	}
+
+	labelValues := make(model.LabelValues, 0, len(parsedResp.Data))
+	for _, label := range parsedResp.Data {
+		labelValues = append(labelValues, model.LabelValue(label))
+	}
+
+	return labelValues, nil
+}
+
+// Series returns matching series based on the request.
+func (c *CoordinatorClient) Series(
+	req SeriesRequest,
+	headers Headers,
+) ([]model.Metric, error) {
+	urlPathAndQuery := fmt.Sprintf("%s?%s", route.SeriesMatchURL, req.String())
+	resp, err := c.runQuery(urlPathAndQuery, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsedResp seriesResponse
+	if err := json.Unmarshal([]byte(resp), &parsedResp); err != nil {
+		return nil, err
+	}
+
+	series := make([]model.Metric, 0, len(parsedResp.Data))
+	for _, labels := range parsedResp.Data {
+		labelSet := make(model.LabelSet)
+		for name, val := range labels {
+			labelSet[model.LabelName(name)] = model.LabelValue(val)
+		}
+		series = append(series, model.Metric(labelSet))
+	}
+
+	return series, nil
+}
+
 type jsonRangeQueryResponse struct {
 	Status string
 	Data   matrixResult
@@ -791,6 +945,16 @@ type jsonRangeQueryResponse struct {
 type matrixResult struct {
 	ResultType model.ValueType
 	Result     model.Matrix
+}
+
+type labelResponse struct {
+	Status string
+	Data   []string
+}
+
+type seriesResponse struct {
+	Status string
+	Data   []map[string]string
 }
 
 func (c *CoordinatorClient) runQuery(
@@ -819,7 +983,8 @@ func (c *CoordinatorClient) runQuery(
 	b, err := ioutil.ReadAll(resp.Body)
 
 	if status := resp.StatusCode; status != http.StatusOK {
-		return "", fmt.Errorf("query response status not OK, received %v", status)
+		return "", fmt.Errorf("query response status not OK, received %v. error=%v",
+			status, string(b))
 	}
 
 	if contentType, ok := resp.Header["Content-Type"]; !ok {
@@ -881,3 +1046,80 @@ func toResponse(
 
 	return nil
 }
+
+// GraphiteQuery retrieves graphite raw data.
+func (c *CoordinatorClient) GraphiteQuery(
+	graphiteReq GraphiteQueryRequest,
+) ([]Datapoint, error) {
+	if graphiteReq.From.IsZero() {
+		graphiteReq.From = time.Now().Add(-24 * time.Hour)
+	}
+	if graphiteReq.Until.IsZero() {
+		graphiteReq.Until = time.Now()
+	}
+
+	queryStr := fmt.Sprintf(
+		"%s?target=%s&from=%d&until=%d",
+		graphite.ReadURL, graphiteReq.Target,
+		graphiteReq.From.Unix(),
+		graphiteReq.Until.Unix(),
+	)
+
+	url := c.makeURL(queryStr)
+	logger := c.logger.With(
+		ZapMethod("graphiteQuery"), zap.String("url", url))
+	logger.Info("running")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		logger.Error("failed get", zap.Error(err))
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if status := resp.StatusCode; status != http.StatusOK {
+		return nil, fmt.Errorf("query response status not OK, received %v %s", status, resp.Status)
+	}
+
+	var parsedResp jsonGraphiteQueryResponse
+	if err := json.Unmarshal(b, &parsedResp); err != nil {
+		return nil, err
+	}
+
+	if len(parsedResp) == 0 {
+		return nil, nil
+	}
+
+	results := make([]Datapoint, 0, len(parsedResp[0].Datapoints))
+	for _, dp := range parsedResp[0].Datapoints {
+		if len(dp) != 2 {
+			return nil, fmt.Errorf("failed to parse response: %s", string(b))
+		}
+
+		results = append(results, Datapoint{
+			Value:     dp[0],
+			Timestamp: int64(*dp[1]),
+		})
+	}
+
+	return results, nil
+}
+
+type jsonGraphiteQueryResponse []series
+
+type series struct {
+	Target     string
+	Datapoints []tuple
+	StepSizeMs int
+}
+
+type tuple []*float64

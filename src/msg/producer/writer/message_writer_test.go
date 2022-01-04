@@ -26,15 +26,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/m3db/m3/src/msg/producer"
-	"github.com/m3db/m3/src/x/instrument"
-	"github.com/m3db/m3/src/x/retry"
-	xtest "github.com/m3db/m3/src/x/test"
-
 	"github.com/fortytw2/leaktest"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/uber-go/tally"
+
+	"github.com/m3db/m3/src/msg/producer"
+	"github.com/m3db/m3/src/x/instrument"
+	"github.com/m3db/m3/src/x/retry"
+	xtest "github.com/m3db/m3/src/x/test"
 )
 
 func TestMessageWriterRandomIndex(t *testing.T) {
@@ -160,7 +160,7 @@ func TestMessageWriterWithPooling(t *testing.T) {
 	require.Equal(t, 1, w.queue.Len())
 
 	mm2.EXPECT().Finalize(producer.Consumed)
-	w.Ack(metadata{shard: 200, id: 2})
+	w.Ack(metadata{metadataKey: metadataKey{shard: 200, id: 2}})
 	require.True(t, isEmptyWithLock(w.acks))
 	for {
 		w.RLock()
@@ -243,7 +243,7 @@ func TestMessageWriterWithoutPooling(t *testing.T) {
 	require.Equal(t, 1, w.queue.Len())
 
 	mm2.EXPECT().Finalize(producer.Consumed)
-	w.Ack(metadata{shard: 200, id: 2})
+	w.Ack(metadata{metadataKey: metadataKey{shard: 200, id: 2}})
 	require.True(t, isEmptyWithLock(w.acks))
 	for {
 		w.RLock()
@@ -295,7 +295,7 @@ func TestMessageWriterRetryWithoutPooling(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	_, ok := w.acks.ackMap[metadata{shard: 200, id: 1}]
+	_, ok := w.acks.ackMap[metadataKey{shard: 200, id: 1}]
 	require.True(t, ok)
 
 	cw := newConsumerWriter(addr, a, opts, testConsumerWriterMetrics())
@@ -355,7 +355,7 @@ func TestMessageWriterRetryWithPooling(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	m1, ok := w.acks.ackMap[metadata{shard: 200, id: 1}]
+	m1, ok := w.acks.ackMap[metadataKey{shard: 200, id: 1}]
 	require.True(t, ok)
 
 	cw := newConsumerWriter(addr, a, opts, testConsumerWriterMetrics())
@@ -453,8 +453,10 @@ func TestMessageWriterCleanupAckedMessage(t *testing.T) {
 	}
 	acks := w.acks
 	meta := metadata{
-		id:    1,
-		shard: 200,
+		metadataKey: metadataKey{
+			id:    1,
+			shard: 200,
+		},
 	}
 	// The message will not be finalized because it's still being hold by another message writer.
 	acks.ack(meta)
@@ -533,8 +535,8 @@ func TestMessageWriterKeepNewWritesInOrderInFrontOfTheQueue(t *testing.T) {
 	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 
-	opts := testOptions().SetMessageRetryOptions(
-		retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond),
+	opts := testOptions().SetMessageRetryNanosFn(
+		NextRetryNanosFn(retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond)),
 	)
 	w := newMessageWriter(200, testMessagePool(opts), opts, testMessageWriterMetrics()).(*messageWriterImpl)
 
@@ -577,8 +579,8 @@ func TestMessageWriterRetryIterateBatchFullScan(t *testing.T) {
 	defer ctrl.Finish()
 
 	retryBatchSize := 2
-	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryOptions(
-		retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond),
+	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryNanosFn(
+		NextRetryNanosFn(retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond)),
 	)
 	w := newMessageWriter(200, testMessagePool(opts), opts, testMessageWriterMetrics()).(*messageWriterImpl)
 
@@ -642,8 +644,8 @@ func TestMessageWriterRetryIterateBatchFullScanWithMessageTTL(t *testing.T) {
 	defer ctrl.Finish()
 
 	retryBatchSize := 2
-	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryOptions(
-		retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond),
+	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryNanosFn(
+		NextRetryNanosFn(retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond)),
 	)
 	w := newMessageWriter(200, testMessagePool(opts), opts, testMessageWriterMetrics()).(*messageWriterImpl)
 
@@ -704,8 +706,8 @@ func TestMessageWriterRetryIterateBatchNotFullScan(t *testing.T) {
 	defer ctrl.Finish()
 
 	retryBatchSize := 100
-	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryOptions(
-		retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond),
+	opts := testOptions().SetMessageQueueScanBatchSize(retryBatchSize).SetMessageRetryNanosFn(
+		NextRetryNanosFn(retry.NewOptions().SetInitialBackoff(2 * time.Nanosecond).SetMaxBackoff(5 * time.Nanosecond)),
 	)
 	w := newMessageWriter(200, testMessagePool(opts), opts, testMessageWriterMetrics()).(*messageWriterImpl)
 
@@ -774,9 +776,15 @@ func TestMessageWriterRetryIterateBatchNotFullScan(t *testing.T) {
 
 func TestNextRetryAfterNanos(t *testing.T) {
 	backoffDuration := time.Minute
-	opts := testOptions().SetMessageRetryOptions(
-		retry.NewOptions().SetInitialBackoff(backoffDuration).SetMaxBackoff(2 * backoffDuration).SetJitter(true),
-	)
+	opts := testOptions().
+		SetMessageRetryNanosFn(
+			NextRetryNanosFn(
+				retry.NewOptions().
+					SetInitialBackoff(backoffDuration).
+					SetMaxBackoff(2 * backoffDuration).
+					SetJitter(true),
+			),
+		)
 	w := newMessageWriter(200, nil, opts, testMessageWriterMetrics()).(*messageWriterImpl)
 
 	nowNanos := time.Now().UnixNano()
@@ -794,6 +802,31 @@ func TestNextRetryAfterNanos(t *testing.T) {
 	m.IncWriteTimes()
 	retryAtNanos = w.nextRetryAfterNanos(m.WriteTimes()) + nowNanos
 	require.True(t, retryAtNanos == nowNanos+2*int64(backoffDuration))
+}
+
+func TestStaticRetryAfterNanos(t *testing.T) {
+	fn, err := StaticRetryNanosFn([]time.Duration{time.Minute, 10 * time.Second, 5 * time.Second})
+	require.NoError(t, err)
+
+	opts := testOptions().SetMessageRetryNanosFn(fn)
+	w := newMessageWriter(200, nil, opts, testMessageWriterMetrics()).(*messageWriterImpl)
+
+	m := newMessage()
+	m.IncWriteTimes()
+	retryAtNanos := w.nextRetryAfterNanos(m.WriteTimes())
+	require.Equal(t, int64(time.Minute), retryAtNanos)
+
+	m.IncWriteTimes()
+	retryAtNanos = w.nextRetryAfterNanos(m.WriteTimes())
+	require.Equal(t, int64(10*time.Second), retryAtNanos)
+
+	m.IncWriteTimes()
+	retryAtNanos = w.nextRetryAfterNanos(m.WriteTimes())
+	require.Equal(t, int64(5*time.Second), retryAtNanos)
+
+	m.IncWriteTimes()
+	retryAtNanos = w.nextRetryAfterNanos(m.WriteTimes())
+	require.Equal(t, int64(5*time.Second), retryAtNanos)
 }
 
 func TestExpectedProcessedAt(t *testing.T) {

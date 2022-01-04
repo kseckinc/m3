@@ -29,16 +29,23 @@ import (
 
 const (
 	retryMaxInterval = 5 * time.Second
-	retryMaxTime     = 3 * time.Minute
+	retryMaxTime     = 1 * time.Minute
 )
 
 // Retry is a function for retrying an operation in integration tests.
 // Exponentially backs off between retries with a max wait of 5 seconds
 // Waits up to a minute total for an operation to complete.
 func Retry(op func() error) error {
+	return RetryWithMaxTime(op, retryMaxTime)
+}
+
+// RetryWithMaxTime is a function for retrying an operation in integration tests.
+// Exponentially backs off between retries with a max wait of 5 seconds
+// Waits up to the max time provided to complete.
+func RetryWithMaxTime(op func() error, maxTime time.Duration) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.MaxInterval = retryMaxInterval
-	bo.MaxElapsedTime = retryMaxTime
+	bo.MaxElapsedTime = maxTime
 	return backoff.Retry(op, bo)
 }
 

@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/m3db/m3/src/integration/resources"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
 )
@@ -75,6 +76,10 @@ func newDockerHTTPCoordinator(
 			RetryFunc: resource.pool.Retry,
 		}),
 	}, nil
+}
+
+func (c *coordinator) Start() {
+	// noop as docker container should already be started
 }
 
 func (c *coordinator) HostDetails() (*resources.InstanceInfo, error) {
@@ -205,12 +210,28 @@ func (c *coordinator) WriteCarbon(
 	return c.client.WriteCarbon(url, metric, v, t)
 }
 
-func (c *coordinator) WriteProm(name string, tags map[string]string, samples []prompb.Sample) error {
+func (c *coordinator) WriteProm(
+	name string,
+	tags map[string]string,
+	samples []prompb.Sample,
+	headers resources.Headers,
+) error {
 	if c.resource.closed {
 		return errClosed
 	}
 
-	return c.client.WriteProm(name, tags, samples)
+	return c.client.WriteProm(name, tags, samples, headers)
+}
+
+func (c *coordinator) WritePromWithRequest(
+	writeRequest prompb.WriteRequest,
+	headers resources.Headers,
+) error {
+	if c.resource.closed {
+		return errClosed
+	}
+
+	return c.client.WritePromWithRequest(writeRequest, headers)
 }
 
 func (c *coordinator) ApplyKVUpdate(update string) error {
@@ -222,7 +243,9 @@ func (c *coordinator) ApplyKVUpdate(update string) error {
 }
 
 func (c *coordinator) RunQuery(
-	verifier resources.ResponseVerifier, query string, headers map[string][]string,
+	verifier resources.ResponseVerifier,
+	query string,
+	headers resources.Headers,
 ) error {
 	if c.resource.closed {
 		return errClosed
@@ -233,7 +256,7 @@ func (c *coordinator) RunQuery(
 
 func (c *coordinator) InstantQuery(
 	req resources.QueryRequest,
-	headers map[string][]string,
+	headers resources.Headers,
 ) (model.Vector, error) {
 	if c.resource.closed {
 		return nil, errClosed
@@ -241,15 +264,79 @@ func (c *coordinator) InstantQuery(
 	return c.client.InstantQuery(req, headers)
 }
 
+// InstantQueryWithEngine runs an instant query with provided headers and the specified
+// query engine.
+func (c *coordinator) InstantQueryWithEngine(
+	req resources.QueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Vector, error) {
+	if c.resource.closed {
+		return nil, errClosed
+	}
+	return c.client.InstantQueryWithEngine(req, engine, headers)
+}
+
 // RangeQuery runs a range query with provided headers
 func (c *coordinator) RangeQuery(
 	req resources.RangeQueryRequest,
-	headers map[string][]string,
+	headers resources.Headers,
 ) (model.Matrix, error) {
 	if c.resource.closed {
 		return nil, errClosed
 	}
 	return c.client.RangeQuery(req, headers)
+}
+
+// GraphiteQuery retrieves graphite raw data.
+func (c *coordinator) GraphiteQuery(req resources.GraphiteQueryRequest) ([]resources.Datapoint, error) {
+	return c.client.GraphiteQuery(req)
+}
+
+// RangeQueryWithEngine runs a range query with provided headers and the specified
+// query engine.
+func (c *coordinator) RangeQueryWithEngine(
+	req resources.RangeQueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Matrix, error) {
+	if c.resource.closed {
+		return nil, errClosed
+	}
+	return c.client.RangeQueryWithEngine(req, engine, headers)
+}
+
+// LabelNames return matching label names based on the request.
+func (c *coordinator) LabelNames(
+	req resources.LabelNamesRequest,
+	headers resources.Headers,
+) (model.LabelNames, error) {
+	if c.resource.closed {
+		return nil, errClosed
+	}
+	return c.client.LabelNames(req, headers)
+}
+
+// LabelValues returns matching label values based on the request.
+func (c *coordinator) LabelValues(
+	req resources.LabelValuesRequest,
+	headers resources.Headers,
+) (model.LabelValues, error) {
+	if c.resource.closed {
+		return nil, errClosed
+	}
+	return c.client.LabelValues(req, headers)
+}
+
+// Series returns matching series based on the request.
+func (c *coordinator) Series(
+	req resources.SeriesRequest,
+	headers resources.Headers,
+) ([]model.Metric, error) {
+	if c.resource.closed {
+		return nil, errClosed
+	}
+	return c.client.Series(req, headers)
 }
 
 func (c *coordinator) Close() error {

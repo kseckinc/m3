@@ -30,7 +30,6 @@ import (
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
 	ingestm3msg "github.com/m3db/m3/src/cmd/services/m3coordinator/ingest/m3msg"
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/server/m3msg"
-	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/metrics/aggregation"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/graphite/graphite"
@@ -112,6 +111,9 @@ var (
 		Size:                  4096,
 		KillWorkerProbability: 0.001,
 	}
+
+	// By default, return up to 4 metric metadata stats per request.
+	defaultMaxMetricMetadataStats = 4
 )
 
 // Configuration is the configuration for the query service.
@@ -155,9 +157,6 @@ type Configuration struct {
 
 	// Backend is the backend store for query service.
 	Backend BackendStorageType `yaml:"backend"`
-
-	// Encoding is the encoding configuration options.
-	Encoding client.EncodingConfiguration `yaml:"encoding"`
 
 	// TagOptions is the tag configuration options.
 	TagOptions TagOptionsConfiguration `yaml:"tagOptions"`
@@ -365,7 +364,12 @@ type PrometheusQueryConfiguration struct {
 // ConvertOptionsOrDefault creates storage.PromConvertOptions based on the given configuration.
 func (c PrometheusQueryConfiguration) ConvertOptionsOrDefault() storage.PromConvertOptions {
 	opts := storage.NewPromConvertOptions()
+
 	if v := c.Convert; v != nil {
+		if value := v.ResolutionThresholdForCounterNormalization; value != nil {
+			opts = opts.SetResolutionThresholdForCounterNormalization(*value)
+		}
+
 		opts = opts.SetValueDecreaseTolerance(v.ValueDecreaseTolerance)
 
 		// Default to max time so that it's always applicable if value
@@ -382,6 +386,11 @@ func (c PrometheusQueryConfiguration) ConvertOptionsOrDefault() storage.PromConv
 
 // PrometheusConvertConfiguration configures Prometheus time series conversions.
 type PrometheusConvertConfiguration struct {
+	// ResolutionThresholdForCounterNormalization sets the resolution threshold starting from which
+	// Prometheus counter normalization is performed in order to avoid Prometheus counter
+	// extrapolation artifacts.
+	ResolutionThresholdForCounterNormalization *time.Duration `yaml:"resolutionThresholdForCounterNormalization"`
+
 	// ValueDecreaseTolerance allows for setting a specific amount of tolerance
 	// to avoid returning a decrease if it's below a certain tolerance.
 	// This is useful for applications that have precision issues emitting
@@ -441,6 +450,11 @@ type PerQueryLimitsConfiguration struct {
 
 	// RequireExhaustive results in an error if the query exceeds any limit.
 	RequireExhaustive *bool `yaml:"requireExhaustive"`
+
+	// MaxMetricMetadataStats limits the number of metric metadata stats to return
+	// as a response header after a query. If unset, defaults to 4. If set to zero,
+	// no metric metadata stats will be returned as a response header.
+	MaxMetricMetadataStats *int `yaml:"maxMetricMetadataStats"`
 }
 
 // AsFetchOptionsBuilderLimitsOptions converts this configuration to
@@ -461,12 +475,18 @@ func (l *PerQueryLimitsConfiguration) AsFetchOptionsBuilderLimitsOptions() handl
 		requireExhaustive = *r
 	}
 
+	maxMetricMetadataStats := defaultMaxMetricMetadataStats
+	if v := l.MaxMetricMetadataStats; v != nil {
+		maxMetricMetadataStats = *v
+	}
+
 	return handleroptions.FetchOptionsBuilderLimitsOptions{
-		SeriesLimit:       int(seriesLimit),
-		InstanceMultiple:  l.InstanceMultiple,
-		DocsLimit:         int(docsLimit),
-		RangeLimit:        l.MaxFetchedRange,
-		RequireExhaustive: requireExhaustive,
+		SeriesLimit:            seriesLimit,
+		InstanceMultiple:       l.InstanceMultiple,
+		DocsLimit:              docsLimit,
+		RangeLimit:             l.MaxFetchedRange,
+		RequireExhaustive:      requireExhaustive,
+		MaxMetricMetadataStats: maxMetricMetadataStats,
 	}
 }
 

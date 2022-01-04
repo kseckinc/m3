@@ -39,6 +39,7 @@ import (
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
 	"github.com/m3db/m3/src/integration/resources"
 	nettest "github.com/m3db/m3/src/integration/resources/net"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
 	"github.com/m3db/m3/src/query/server"
@@ -52,6 +53,7 @@ const (
 	shutdownTimeout  = time.Minute
 )
 
+//nolint:maligned
 // Coordinator is an in-process implementation of resources.Coordinator for use
 // in integration tests.
 type Coordinator struct {
@@ -60,19 +62,23 @@ type Coordinator struct {
 	logger   *zap.Logger
 	tmpDirs  []string
 	embedded bool
-	startFn  StartFn
+	startFn  CoordinatorStartFn
+	started  bool
 
 	interruptCh chan<- error
 	shutdownCh  <-chan struct{}
 }
 
+//nolint:maligned
 // CoordinatorOptions are options for starting a coordinator server.
 type CoordinatorOptions struct {
 	// GeneratePorts will automatically update the config to use open ports
 	// if set to true. If false, configuration is used as-is re: ports.
 	GeneratePorts bool
 	// StartFn is a custom function that can be used to start the Coordinator.
-	StartFn StartFn
+	StartFn CoordinatorStartFn
+	// Start indicates whether to start the coordinator instance.
+	Start bool
 	// Logger is the logger to use for the coordinator. If not provided,
 	// a default one will be created.
 	Logger *zap.Logger
@@ -168,7 +174,9 @@ func NewCoordinator(cfg config.Configuration, opts CoordinatorOptions) (resource
 		tmpDirs: tmpDirs,
 		startFn: opts.StartFn,
 	}
-	coord.start()
+	if opts.Start {
+		coord.Start()
+	}
 
 	return coord, nil
 }
@@ -206,9 +214,17 @@ func NewEmbeddedCoordinator(d *DBNode) (resources.Coordinator, error) {
 	}, nil
 }
 
-func (c *Coordinator) start() {
+// Start is the start method for the coordinator.
+//nolint:dupl
+func (c *Coordinator) Start() {
+	if c.started {
+		c.logger.Debug("coordinator already started")
+		return
+	}
+	c.started = true
+
 	if c.startFn != nil {
-		c.interruptCh, c.shutdownCh = c.startFn()
+		c.interruptCh, c.shutdownCh = c.startFn(&c.cfg)
 		return
 	}
 
@@ -373,6 +389,8 @@ func (c *Coordinator) Close() error {
 			" not be completely graceful")
 	}
 
+	c.started = false
+
 	return nil
 }
 
@@ -406,19 +424,30 @@ func (c *Coordinator) ApplyKVUpdate(update string) error {
 
 // WriteCarbon writes a carbon metric datapoint at a given time.
 func (c *Coordinator) WriteCarbon(port int, metric string, v float64, t time.Time) error {
-	return c.client.WriteCarbon(fmt.Sprintf("http://0.0.0.0/%d", port), metric, v, t)
+	return c.client.WriteCarbon(fmt.Sprintf("0.0.0.0:%d", port), metric, v, t)
 }
 
-// WriteProm writes a prometheus metric.
-func (c *Coordinator) WriteProm(name string, tags map[string]string, samples []prompb.Sample) error {
-	return c.client.WriteProm(name, tags, samples)
+// WriteProm writes a prometheus metric. Takes tags/labels as a map for convenience.
+func (c *Coordinator) WriteProm(
+	name string,
+	tags map[string]string,
+	samples []prompb.Sample,
+	headers resources.Headers,
+) error {
+	return c.client.WriteProm(name, tags, samples, headers)
+}
+
+// WritePromWithRequest executes a prometheus write request. Allows you to
+// provide the request directly which is useful for batch metric requests.
+func (c *Coordinator) WritePromWithRequest(writeRequest prompb.WriteRequest, headers resources.Headers) error {
+	return c.client.WritePromWithRequest(writeRequest, headers)
 }
 
 // RunQuery runs the given query with a given verification function.
 func (c *Coordinator) RunQuery(
 	verifier resources.ResponseVerifier,
 	query string,
-	headers map[string][]string,
+	headers resources.Headers,
 ) error {
 	return c.client.RunQuery(verifier, query, headers)
 }
@@ -426,17 +455,72 @@ func (c *Coordinator) RunQuery(
 // InstantQuery runs an instant query with provided headers
 func (c *Coordinator) InstantQuery(
 	req resources.QueryRequest,
-	headers map[string][]string,
+	headers resources.Headers,
 ) (model.Vector, error) {
 	return c.client.InstantQuery(req, headers)
+}
+
+// InstantQueryWithEngine runs an instant query with provided headers and the specified
+// query engine.
+func (c *Coordinator) InstantQueryWithEngine(
+	req resources.QueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Vector, error) {
+	return c.client.InstantQueryWithEngine(req, engine, headers)
 }
 
 // RangeQuery runs a range query with provided headers
 func (c *Coordinator) RangeQuery(
 	req resources.RangeQueryRequest,
-	headers map[string][]string,
+	headers resources.Headers,
 ) (model.Matrix, error) {
 	return c.client.RangeQuery(req, headers)
+}
+
+// GraphiteQuery retrieves graphite raw data.
+func (c *Coordinator) GraphiteQuery(req resources.GraphiteQueryRequest) ([]resources.Datapoint, error) {
+	return c.client.GraphiteQuery(req)
+}
+
+// RangeQueryWithEngine runs a range query with provided headers and the specified
+// query engine.
+func (c *Coordinator) RangeQueryWithEngine(
+	req resources.RangeQueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Matrix, error) {
+	return c.client.RangeQueryWithEngine(req, engine, headers)
+}
+
+// LabelNames return matching label names based on the request.
+func (c *Coordinator) LabelNames(
+	req resources.LabelNamesRequest,
+	headers resources.Headers,
+) (model.LabelNames, error) {
+	return c.client.LabelNames(req, headers)
+}
+
+// LabelValues returns matching label values based on the request.
+func (c *Coordinator) LabelValues(
+	req resources.LabelValuesRequest,
+	headers resources.Headers,
+) (model.LabelValues, error) {
+	return c.client.LabelValues(req, headers)
+}
+
+// Series returns matching series based on the request.
+func (c *Coordinator) Series(
+	req resources.SeriesRequest,
+	headers resources.Headers,
+) ([]model.Metric, error) {
+	return c.client.Series(req, headers)
+}
+
+// Configuration returns a copy of the configuration used to
+// start this coordinator.
+func (c *Coordinator) Configuration() config.Configuration {
+	return c.cfg
 }
 
 func updateCoordinatorConfig(

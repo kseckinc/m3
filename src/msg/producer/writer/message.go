@@ -31,11 +31,12 @@ import (
 type message struct {
 	*producer.RefCountedMessage
 
-	pb                     msgpb.Message
-	meta                   metadata
-	initNanos              int64
-	retryAtNanos           int64
-	expectedProcessAtNanos int64
+	pb           msgpb.Message
+	meta         metadata
+	initNanos    int64
+	retryAtNanos int64
+	// updated by the writing goroutine and read by the acking goroutine.
+	expectedProcessAtNanos atomic.Int64
 	retried                int
 	// NB(cw) isAcked could be accessed concurrently by the background thread
 	// in message writer and acked by consumer service writers.
@@ -74,7 +75,7 @@ func (m *message) InitNanos() int64 {
 // ExpectedProcessAtNanos returns the nanosecond when the message should be processed. Used to calculate processing lag
 // in the system.
 func (m *message) ExpectedProcessAtNanos() int64 {
-	return m.expectedProcessAtNanos
+	return m.expectedProcessAtNanos.Load()
 }
 
 // RetryAtNanos returns the timestamp for next retry in nano seconds.
@@ -85,9 +86,9 @@ func (m *message) RetryAtNanos() int64 {
 // SetRetryAtNanos sets the next retry nanos.
 func (m *message) SetRetryAtNanos(value int64) {
 	if m.retryAtNanos > 0 {
-		m.expectedProcessAtNanos = m.retryAtNanos
+		m.expectedProcessAtNanos.Store(m.retryAtNanos)
 	} else {
-		m.expectedProcessAtNanos = m.initNanos
+		m.expectedProcessAtNanos.Store(m.initNanos)
 	}
 	m.retryAtNanos = value
 }
@@ -120,6 +121,11 @@ func (m *message) ShardID() uint64 {
 // Metadata returns the metadata.
 func (m *message) Metadata() metadata {
 	return m.meta
+}
+
+// SetSentAt sets the sentAtNanos on the metadata proto.
+func (m *message) SetSentAt(nanos int64) {
+	m.pb.Metadata.SentAtNanos = uint64(nanos)
 }
 
 // Marshaler returns the marshaler and a bool to indicate whether the marshaler is valid.

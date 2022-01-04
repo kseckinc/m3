@@ -401,8 +401,6 @@ func TestConfiguration(t *testing.T) {
     backgroundHealthCheckFailThrottleFactor: 0.5
     hashing:
       seed: 42
-    encoding:
-      m3tsz: null
     proto: null
     asyncWriteWorkerPoolSize: null
     asyncWriteMaxConcurrency: null
@@ -457,8 +455,8 @@ func TestConfiguration(t *testing.T) {
     queueChannel: null
   repair:
     enabled: false
-    type: 0
-    strategy: 0
+    type: default
+    strategy: default
     force: false
     throttle: 2m0s
     checkInterval: 1m0s
