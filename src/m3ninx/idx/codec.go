@@ -37,3 +37,12 @@ func Unmarshal(data []byte) (Query, error) {
 	}
 	return Query{query: q}, nil
 }
+
+// UnmarshalWithMetadata decodes a query from a byte slice.
+func UnmarshalWithMetadata(data []byte) (Query, []string, error) {
+	q, metadata, err := query.UnmarshalMetadata(data)
+	if err != nil {
+		return Query{}, nil, err
+	}
+	return Query{query: q}, metadata, nil
+}

@@ -144,4 +144,15 @@ func TestIndexMultipleBlockQuery(t *testing.T) {
 	writes := append(writesPeriod0, writesPeriod1...)
 	writes.MatchesSeriesIters(t, period01Results)
 	log.Info("found period 0+1 results")
+
+	log.Info("querying period 0+1 cardinality results")
+	query = index.Query{
+		Query: idx.NewConjunctionQuery(idx.NewTermQuery([]byte("shared"), []byte("shared")),
+			idx.NewTermQuery([]byte("__metadata__"), []byte("cardinality")))}
+	period01CardinalityResults, _, err := session.FetchTagged(ContextWithDefaultTimeout(),
+		md.ID(), query, index.QueryOptions{StartInclusive: t0.Add(-1 * time.Hour), EndExclusive: t2.Add(1 * time.Hour)})
+	require.NoError(t, err)
+	// writes := append(writesPeriod0, writesPeriod1...)
+	writes.MatchesSeriesItersCardinality(t, period01CardinalityResults)
+	log.Info("found period 0+1 results")
 }

@@ -27,6 +27,7 @@ var (
 )
 
 type rangeIter struct {
+	size           uint64
 	startInclusive ID
 	endExclusive   ID
 	closed         bool
@@ -36,6 +37,7 @@ type rangeIter struct {
 // NewRangeIterator returns a new Iterator over the specified range.
 func NewRangeIterator(startInclusive, endExclusive ID) Iterator {
 	return &rangeIter{
+		size:           uint64(endExclusive - startInclusive), // was uint64(endExclusive - 1 - startInclusive)
 		startInclusive: startInclusive,
 		endExclusive:   endExclusive,
 	}
@@ -54,6 +56,10 @@ func (r *rangeIter) Next() bool {
 
 func (r *rangeIter) Current() ID {
 	return r.startInclusive
+}
+
+func (r *rangeIter) EstimateCardinality() uint64 {
+	return r.size
 }
 
 func (r *rangeIter) Err() error {

@@ -196,7 +196,8 @@ func (d *postingsList) Len() int {
 
 func (d *postingsList) Iterator() postings.Iterator {
 	return &roaringIterator{
-		iter: d.bitmap.Iterator(),
+		bitmap: d.bitmap,
+		// iter: d.bitmap.Iterator(),
 	}
 }
 
@@ -231,6 +232,7 @@ func (d *postingsList) Equal(other postings.List) bool {
 }
 
 type roaringIterator struct {
+	bitmap  *roaring.Bitmap
 	iter    *roaring.Iterator
 	current postings.ID
 	closed  bool
@@ -244,12 +246,21 @@ func (it *roaringIterator) Next() bool {
 	if it.closed {
 		return false
 	}
+
+	if it.iter == nil {
+		it.iter = it.bitmap.Iterator()
+	}
+
 	v, eof := it.iter.Next()
 	if eof {
 		return false
 	}
 	it.current = postings.ID(v)
 	return true
+}
+
+func (it *roaringIterator) EstimateCardinality() uint64 {
+	return it.bitmap.Count()
 }
 
 func (it *roaringIterator) Err() error {

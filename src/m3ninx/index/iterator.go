@@ -63,6 +63,13 @@ func (e *documentIterator) Current() doc.Document {
 	return e.currDoc
 }
 
+func (e *documentIterator) EstimateCardinality() uint64 {
+	if e.closed || e.err != nil {
+		return 0
+	}
+	return e.postingsIter.EstimateCardinality()
+}
+
 func (e *documentIterator) Err() error {
 	return e.err
 }

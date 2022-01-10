@@ -48,7 +48,8 @@ type results struct {
 	resultsMap     *ResultsMap
 	totalDocsCount int
 
-	idPool    ident.Pool
+	idPool ident.Pool
+	// TODO: looks like bytesPool is not used
 	bytesPool pool.CheckedBytesPool
 
 	pool QueryResultsPool

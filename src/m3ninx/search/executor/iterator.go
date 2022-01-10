@@ -100,6 +100,20 @@ func (it *iterator) Next() bool {
 	return true
 }
 
+func (it *iterator) EstimateCardinality() uint64 {
+	if it.iters == nil {
+		if err := it.initIters(); err != nil {
+			it.err = err
+			return 0
+		}
+	}
+	var estimatedCardinality uint64
+	for _, iter := range it.iters {
+		estimatedCardinality += iter.EstimateCardinality()
+	}
+	return estimatedCardinality
+}
+
 func (it *iterator) next() bool {
 	if it.idx == len(it.iters) {
 		return false

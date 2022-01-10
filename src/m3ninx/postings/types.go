@@ -114,6 +114,8 @@ type Iterator interface {
 	// after a call to Next confirms there are more IDs remaining.
 	Current() ID
 
+	EstimateCardinality() uint64
+
 	// Err returns any errors encountered during iteration.
 	Err() error
 

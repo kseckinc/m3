@@ -21,19 +21,20 @@
 package builder
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
 	"sync"
+
+	"github.com/cespare/xxhash/v2"
+	"github.com/twotwotwo/sorts"
 
 	"github.com/m3db/m3/src/m3ninx/doc"
 	"github.com/m3db/m3/src/m3ninx/index"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
 	"github.com/m3db/m3/src/m3ninx/postings"
 	"github.com/m3db/m3/src/m3ninx/util"
-
-	"github.com/cespare/xxhash/v2"
-	"github.com/twotwotwo/sorts"
 )
 
 var (
@@ -412,6 +413,20 @@ func (b *builder) insertBatchWithLock(batch index.Batch) *index.BatchPartialErro
 			Name:  doc.IDReservedFieldName,
 			Value: d.ID,
 		}, i, batchErr)
+
+		shardID := batch.ShardID
+		if len(shardID) == 0 {
+			// compute shard of not passed
+			shard := uint32(xxhash.Sum64(d.ID) % uint64(12)) // TODO: use NumShards here
+			shardID = make([]byte, 4)
+			binary.LittleEndian.PutUint32(shardID, shard)
+		}
+
+		b.queueIndexJobEntryWithLock(wg, postings.ID(postingsListID), doc.Field{
+			Name:  doc.IDReservedShardFieldName,
+			Value: shardID,
+		}, i, batchErr)
+
 	}
 
 	// Enqueue any partially filled sharded jobs.

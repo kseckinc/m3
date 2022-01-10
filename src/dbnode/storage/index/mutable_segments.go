@@ -288,6 +288,7 @@ func (m *mutableSegments) WriteBatch(inserts *WriteBatch) (MutableSegmentsStats,
 	insertResultErr := segmentBuilder.InsertBatch(m3ninxindex.Batch{
 		Docs:                docs,
 		AllowPartialUpdates: true,
+		ShardID:             inserts.opts.Shard,
 	})
 	n := len(segmentBuilder.Docs())
 	if n == 0 {

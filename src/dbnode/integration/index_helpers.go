@@ -97,6 +97,38 @@ func (w TestIndexWrites) MatchesSeriesIters(
 	require.Equal(t, len(uniqueIDs), actualCount)
 }
 
+// MatchesSeriesItersCardinality matches index writes with expected series.
+func (w TestIndexWrites) MatchesSeriesItersCardinality(
+	t *testing.T,
+	seriesIters encoding.SeriesIterators,
+) {
+	writesByID := make(map[string]TestIndexWrites)
+	for _, wi := range w {
+		writesByID[wi.ID.String()] = append(writesByID[wi.ID.String()], wi)
+	}
+	var actualCount int
+
+	iters := &testSeriesIterators{SeriesIterators: seriesIters}
+	for iters.Next() {
+		iter := iters.Current()
+		id := iter.ID().String()
+		require.Equal(t, "__chronosphere_cardinality__", id)
+
+		for iter.Next() {
+			dp, _, _ := iter.Current()
+			fmt.Printf("ts: %s, val: %g\n", dp.TimestampNanos.ToTime(), dp.Value)
+			actualCount += int(dp.Value)
+		}
+		iter.Close()
+	}
+
+	uniqueIDs := make(map[string]struct{})
+	for _, wi := range w {
+		uniqueIDs[wi.ID.String()] = struct{}{}
+	}
+	require.Equal(t, len(uniqueIDs), actualCount)
+}
+
 // MatchesTestSeriesIters matches index writes with expected test series.
 func (w TestIndexWrites) MatchesTestSeriesIters(
 	t *testing.T,
@@ -359,6 +391,6 @@ func newQuery(t *testing.T, tags ident.TagIterator) idx.Query {
 // ContextWithDefaultTimeout returns a context with a default timeout
 // set of one minute.
 func ContextWithDefaultTimeout() context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), time.Minute) //nolint
+	ctx, _ := context.WithTimeout(context.Background(), time.Minute) // nolint
 	return ctx
 }

@@ -22,6 +22,7 @@ package index
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/limits"
 	"github.com/m3db/m3/src/dbnode/tracepoint"
 	"github.com/m3db/m3/src/m3ninx/doc"
+	"github.com/m3db/m3/src/m3ninx/idx"
 	m3ninxindex "github.com/m3db/m3/src/m3ninx/index"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
 	"github.com/m3db/m3/src/m3ninx/index/segment/fst"
@@ -474,6 +476,73 @@ func (b *block) QueryIter(ctx context.Context, query Query) (QueryIterator, erro
 	}))
 
 	return NewQueryIter(docIter), nil
+}
+
+func (b *block) QueryMetadataIter(ctx context.Context, query Query, baseResults BaseResults) (QueryMetadataIterator, error) {
+	b.RLock()
+	defer b.RUnlock()
+
+	if b.state == blockStateClosed {
+		return nil, ErrUnableToQueryBlockClosed
+	}
+
+	exec, err := b.newExecutorWithRLockFn()
+	if err != nil {
+		return nil, err
+	}
+
+	metadataResults, ok := baseResults.(QueryMetadataResults)
+	if !ok {
+		return nil, fmt.Errorf("unknown results type [%T] received during query", baseResults)
+	}
+
+	shards := metadataResults.Shards()
+	results := make([]QueryMetadataAggregateResult, 0, len(shards))
+	for _, shardID := range shards {
+		shardIDBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(shardIDBytes, shardID)
+		shardQuery := idx.NewTermQuery(doc.IDReservedShardFieldName, shardIDBytes)
+		conjunctionQuery := idx.NewConjunctionQuery(query.Query, shardQuery)
+		docIter, err := exec.Execute(ctx, conjunctionQuery.SearchQuery())
+		if err != nil {
+			b.closeAsync(exec)
+			return nil, err
+		}
+
+		results = append(results, QueryMetadataAggregateResult{
+			GroupedBy: []doc.Field{
+				{
+					Name:  doc.IDReservedShardFieldName,
+					Value: shardIDBytes,
+				},
+			},
+			EstimateCardinality: docIter.EstimateCardinality(),
+		})
+
+		if err := docIter.Close(); err != nil {
+			b.logger.Error("failed to close docIter", zap.Error(err))
+		}
+	}
+
+	// Register the executor to close when context closes
+	// so can avoid copying the results into the map and just take
+	// references to it.
+	ctx.RegisterFinalizer(xresource.FinalizerFn(func() {
+		b.closeAsync(exec)
+	}))
+
+	// TODO: support "GroupBy" in a follow up change:
+	// - Need to do an Aggregate query first for each of the combination of
+	// the term values for those fields we need to run the same search query
+	// but conjuncted with the exact match for each of the term values.
+	/*	results := []QueryMetadataAggregateResult{
+		{
+			GroupedBy:           []doc.Field{},
+			EstimateCardinality: docIter.EstimateCardinality(),
+		},
+	}*/
+
+	return NewQueryMetadataIter(results), nil
 }
 
 // nolint: dupl

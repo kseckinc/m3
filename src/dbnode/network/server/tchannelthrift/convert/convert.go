@@ -124,7 +124,7 @@ type ToSegmentsResult struct {
 }
 
 // ToSegments converts a list of blocks to segments.
-func ToSegments(ctx context.Context, blocks []xio.BlockReader) (ToSegmentsResult, error) { //nolint: gocyclo
+func ToSegments(ctx context.Context, blocks []xio.BlockReader) (ToSegmentsResult, error) { // nolint: gocyclo
 	if len(blocks) == 0 {
 		return ToSegmentsResult{}, nil
 	}
@@ -264,9 +264,17 @@ func FromRPCFetchTaggedRequest(
 		opts.Source = req.Source
 	}
 
-	q, err := idx.Unmarshal(req.Query)
+	q, metadata, err := idx.UnmarshalWithMetadata(req.Query)
 	if err != nil {
 		return nil, index.Query{}, index.QueryOptions{}, false, err
+	}
+
+	if metadata != nil {
+		for _, value := range metadata {
+			if value == "cardinality" {
+				opts.QueryMetadataOptions.Cardinality = true
+			}
+		}
 	}
 
 	var ns ident.ID
@@ -616,6 +624,51 @@ func FromRPCQuery(query *rpc.Query) (idx.Query, error) {
 	}
 
 	return idx.Unmarshal(marshalled)
+}
+
+// FromRPCQueryWithOptions will create a m3ninx index query from an RPC query.
+func FromRPCQueryWithOptions(req *rpc.QueryRequest) (idx.Query, index.QueryOptions, error) {
+	start, rangeStartErr := ToTime(req.RangeStart, req.RangeType)
+	end, rangeEndErr := ToTime(req.RangeEnd, req.RangeType)
+	if rangeStartErr != nil || rangeEndErr != nil {
+		return idx.Query{}, index.QueryOptions{}, tterrors.NewBadRequestError(xerrors.FirstError(rangeStartErr, rangeEndErr))
+	}
+
+	if req.Query == nil {
+		return idx.NewAllQuery(), index.QueryOptions{}, nil
+	}
+
+	queryProto, err := parseQuery(req.Query)
+	if err != nil {
+		return idx.Query{}, index.QueryOptions{}, err
+	}
+
+	opts := index.QueryOptions{
+		StartInclusive: start,
+		EndExclusive:   end,
+	}
+
+	if l := req.Limit; l != nil {
+		opts.SeriesLimit = int(*l)
+	}
+	if len(req.Source) > 0 {
+		opts.Source = req.Source
+	}
+
+	marshalled, err := queryProto.Marshal()
+	if err != nil {
+		return idx.Query{}, opts, err
+	}
+
+	qry, metadata, err := idx.UnmarshalWithMetadata(marshalled)
+	if metadata != nil {
+		for _, value := range metadata {
+			if value == "cardinality" {
+				opts.QueryMetadataOptions.Cardinality = true
+			}
+		}
+	}
+	return qry, opts, nil
 }
 
 func parseQuery(query *rpc.Query) (*querypb.Query, error) {

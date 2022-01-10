@@ -174,6 +174,7 @@ type databaseNamespaceMetrics struct {
 	fetchBlocks         instrument.MethodMetrics
 	fetchBlocksMetadata instrument.MethodMetrics
 	queryIDs            instrument.MethodMetrics
+	queryMetadata       instrument.MethodMetrics
 	wideQuery           instrument.MethodMetrics
 	aggregateQuery      instrument.MethodMetrics
 
@@ -264,6 +265,7 @@ func newDatabaseNamespaceMetrics(
 		fetchBlocks:         instrument.NewMethodMetrics(scope, "fetchBlocks", opts),
 		fetchBlocksMetadata: instrument.NewMethodMetrics(scope, "fetchBlocksMetadata", opts),
 		queryIDs:            instrument.NewMethodMetrics(scope, "queryIDs", opts),
+		queryMetadata:       instrument.NewMethodMetrics(scope, "queryMetadata", opts),
 		wideQuery:           instrument.NewMethodMetrics(scope, "wideQuery", opts),
 		aggregateQuery:      instrument.NewMethodMetrics(scope, "aggregateQuery", opts),
 
@@ -841,6 +843,49 @@ func (n *dbNamespace) QueryIDs(
 		sp.LogFields(opentracinglog.Error(err))
 	}
 	n.metrics.queryIDs.ReportSuccessOrError(err, n.nowFn().Sub(callStart))
+	return res, err
+}
+
+func (n *dbNamespace) QueryMetadata(
+	ctx context.Context,
+	query index.Query,
+	opts index.QueryOptions,
+) (index.QueryMetadataResult, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.NSQueryMetadata)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("query", query.String()),
+			opentracinglog.String("namespace", n.ID().String()),
+			opentracinglog.Int("seriesLimit", opts.SeriesLimit),
+			opentracinglog.Int("docsLimit", opts.DocsLimit),
+			xopentracing.Time("start", opts.StartInclusive.ToTime()),
+			xopentracing.Time("end", opts.EndExclusive.ToTime()),
+		)
+	}
+	defer sp.Finish()
+
+	callStart := n.nowFn()
+	if n.reverseIndex == nil {
+		n.metrics.queryMetadata.ReportError(n.nowFn().Sub(callStart))
+		err := errNamespaceIndexingDisabled
+		sp.LogFields(opentracinglog.Error(err))
+		return index.QueryMetadataResult{}, err
+	}
+
+	if !n.reverseIndex.Bootstrapped() {
+		// Similar to reading shard data, return not bootstrapped
+		n.metrics.queryMetadata.ReportError(n.nowFn().Sub(callStart))
+		err := errIndexNotBootstrappedToRead
+		sp.LogFields(opentracinglog.Error(err))
+		return index.QueryMetadataResult{},
+			xerrors.NewRetryableError(err)
+	}
+
+	res, err := n.reverseIndex.QueryMetadata(ctx, query, opts)
+	if err != nil {
+		sp.LogFields(opentracinglog.Error(err))
+	}
+	n.metrics.queryMetadata.ReportSuccessOrError(err, n.nowFn().Sub(callStart))
 	return res, err
 }
 

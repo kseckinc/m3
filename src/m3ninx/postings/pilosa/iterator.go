@@ -21,8 +21,9 @@
 package pilosa
 
 import (
-	"github.com/m3db/m3/src/m3ninx/postings"
 	"github.com/m3dbx/pilosa/roaring"
+
+	"github.com/m3db/m3/src/m3ninx/postings"
 )
 
 // NB: need to do this to find a path into our postings list which doesn't require every
@@ -30,6 +31,7 @@ import (
 // FOLLOWUP(prateek): tracking this issue in https://github.com/m3db/m3ninx/issues/65
 
 type iterator struct {
+	size    uint64
 	iter    *roaring.Iterator
 	current uint64
 	hasNext bool
@@ -38,8 +40,9 @@ type iterator struct {
 var _ postings.Iterator = &iterator{}
 
 // NewIterator returns a postings.Iterator wrapping a pilosa roaring.Iterator.
-func NewIterator(iter *roaring.Iterator) postings.Iterator {
+func NewIterator(size uint64, iter *roaring.Iterator) postings.Iterator {
 	return &iterator{
+		size:    size,
 		iter:    iter,
 		hasNext: true,
 	}
@@ -57,6 +60,10 @@ func (p *iterator) Next() bool {
 
 func (p *iterator) Current() postings.ID {
 	return postings.ID(p.current)
+}
+
+func (p *iterator) EstimateCardinality() uint64 {
+	return p.size
 }
 
 func (p *iterator) Err() error {

@@ -46,6 +46,9 @@ const (
 	// DBQueryIDs is the operation name for the db QueryIDs path.
 	DBQueryIDs = "storage.db.QueryIDs"
 
+	// DBQueryMetadata is the operation name for the db DBQueryMetadata path.
+	DBQueryMetadata = "storage.db.QueryMetadata"
+
 	// DBAggregateQuery is the operation name for the db AggregateQuery path.
 	DBAggregateQuery = "storage.db.AggregateQuery"
 
@@ -76,6 +79,9 @@ const (
 	// NSQueryIDs is the operation name for the dbNamespace QueryIDs path.
 	NSQueryIDs = "storage.dbNamespace.QueryIDs"
 
+	// NSQueryMetadata is the operation name for the dbNamespace NSQueryMetadata path.
+	NSQueryMetadata = "storage.dbNamespace.QueryMetadata"
+
 	// NSWideQueryIDs is the operation name for the dbNamespace WideQueryIDs path.
 	NSWideQueryIDs = "storage.nsIndex.WideQueryIDs"
 
@@ -94,6 +100,9 @@ const (
 	// NSIdxQuery is the operation name for the nsIndex Query path.
 	NSIdxQuery = "storage.nsIndex.Query"
 
+	// NSIdxQueryMetadata is the operation name for the nsIndex QueryMetadata path.
+	NSIdxQueryMetadata = "storage.nsIndex.QueryMetadata"
+
 	// NSIdxWideQuery is the operation name for the nsIndex WideQuery path.
 	NSIdxWideQuery = "storage.nsIndex.WideQuery"
 
@@ -105,6 +114,9 @@ const (
 
 	// NSIdxBlockQuery is the operation name for the nsIndex block query path.
 	NSIdxBlockQuery = "storage.nsIndex.blockQuery"
+
+	// NSIdxBlockQueryMetadata is the operation name for the nsIndex block query metadata path.
+	NSIdxBlockQueryMetadata = "storage.nsIndex.blockQueryMetadata"
 
 	// NSIdxBlockAggregateQuery is the operation name for the nsIndex block aggregate query path.
 	NSIdxBlockAggregateQuery = "storage.nsIndex.blockAggregateQuery"

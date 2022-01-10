@@ -73,3 +73,63 @@ func (q *queryIter) Counts() (series, docs int) {
 func (q *queryIter) Current() doc.Document {
 	return q.docIter.Current()
 }
+
+type queryMetadataIter struct {
+	// immutable state
+	idx     int
+	results []QueryMetadataAggregateResult
+
+	// not used
+	seriesCount, docCount int
+}
+
+var _ QueryMetadataIterator = &queryMetadataIter{}
+
+// NewQueryMetadataIter wraps the provided QueryDocIterator as a QueryMetadataIterator
+func NewQueryMetadataIter(
+	results []QueryMetadataAggregateResult,
+) QueryMetadataIterator {
+	return &queryMetadataIter{
+		idx:     -1,
+		results: results,
+	}
+}
+
+func (q *queryMetadataIter) Done() bool {
+	return q.idx >= len(q.results)
+}
+
+func (q *queryMetadataIter) Next(_ context.Context) bool {
+	q.idx++
+	if q.Done() {
+		return false
+	}
+	return true
+}
+
+func (q *queryMetadataIter) Err() error {
+	return nil
+}
+
+func (q *queryMetadataIter) Close() error {
+	return nil
+}
+
+func (q *queryMetadataIter) AddSeries(count int) {
+	// Not really relevant, can these be moved out of ResultIterator somehow?
+	q.seriesCount += count
+}
+
+func (q *queryMetadataIter) AddDocs(count int) {
+	// Not really relevant, can these be moved out of ResultIterator somehow?
+	q.docCount += count
+}
+
+func (q *queryMetadataIter) Counts() (series, docs int) {
+	// Not really relevant, can these be moved out of ResultIterator somehow?
+	return q.seriesCount, q.docCount
+}
+
+func (q *queryMetadataIter) Current() QueryMetadataAggregateResult {
+	return q.results[q.idx]
+}

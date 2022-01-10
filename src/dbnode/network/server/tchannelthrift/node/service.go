@@ -26,10 +26,19 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	apachethrift "github.com/apache/thrift/lib/go/thrift"
+	opentracinglog "github.com/opentracing/opentracing-go/log"
+	"github.com/uber-go/tally"
+	"github.com/uber/tchannel-go/thrift"
+	"go.uber.org/zap"
+
 	"github.com/m3db/m3/src/dbnode/client"
+	"github.com/m3db/m3/src/dbnode/encoding"
+	"github.com/m3db/m3/src/dbnode/encoding/m3tsz"
 	"github.com/m3db/m3/src/dbnode/generated/thrift/rpc"
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/network/server/tchannelthrift"
@@ -43,9 +52,11 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/limits/permits"
 	"github.com/m3db/m3/src/dbnode/storage/series"
 	"github.com/m3db/m3/src/dbnode/tracepoint"
+	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/ts/writes"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3/src/dbnode/x/xpool"
+	"github.com/m3db/m3/src/m3ninx/doc"
 	"github.com/m3db/m3/src/m3ninx/index/segment/fst/encoding/docs"
 	"github.com/m3db/m3/src/x/checked"
 	"github.com/m3db/m3/src/x/clock"
@@ -59,12 +70,6 @@ import (
 	xresource "github.com/m3db/m3/src/x/resource"
 	"github.com/m3db/m3/src/x/serialize"
 	xtime "github.com/m3db/m3/src/x/time"
-
-	apachethrift "github.com/apache/thrift/lib/go/thrift"
-	opentracinglog "github.com/opentracing/opentracing-go/log"
-	"github.com/uber-go/tally"
-	"github.com/uber/tchannel-go/thrift"
-	"go.uber.org/zap"
 )
 
 var (
@@ -247,6 +252,7 @@ type pools struct {
 	id                      ident.Pool
 	tagEncoder              serialize.TagEncoderPool
 	checkedBytesWrapper     xpool.CheckedBytesWrapperPool
+	encoder                 encoding.EncoderPool
 	segmentsArray           segmentsArrayPool
 	writeBatchPooledReqPool *writeBatchPooledReqPool
 	blockMetadataV2         tchannelthrift.BlockMetadataV2Pool
@@ -319,6 +325,14 @@ func NewService(db storage.Database, opts tchannelthrift.Options) Service {
 	writeBatchPooledReqPool := newWriteBatchPooledReqPool(writeBatchPoolSize, iopts)
 	writeBatchPooledReqPool.Init()
 
+	encoderPool := encoding.NewEncoderPool(pool.NewObjectPoolOptions())
+	encodingOpts := encoding.NewOptions().SetEncoderPool(encoderPool)
+	encoderPool.Init(
+		func() encoding.Encoder {
+			return m3tsz.NewEncoder(0, nil, m3tsz.DefaultIntOptimizationEnabled, encodingOpts)
+		},
+	)
+
 	return &service{
 		state: serviceState{
 			db: db,
@@ -343,6 +357,7 @@ func NewService(db storage.Database, opts tchannelthrift.Options) Service {
 			writeBatchPooledReqPool: writeBatchPooledReqPool,
 			blockMetadataV2:         opts.BlockMetadataV2Pool(),
 			blockMetadataV2Slice:    opts.BlockMetadataV2SlicePool(),
+			encoder:                 encoderPool,
 		},
 		queryLimits:       opts.QueryLimits(),
 		seriesReadPermits: opts.PermitsOptions().SeriesReadPermitsManager(),
@@ -497,28 +512,73 @@ func (s *service) Query(tctx thrift.Context, req *rpc.QueryRequest) (*rpc.QueryR
 }
 
 func (s *service) query(ctx context.Context, db storage.Database, req *rpc.QueryRequest) (*rpc.QueryResult_, error) {
-	start, rangeStartErr := convert.ToTime(req.RangeStart, req.RangeType)
-	end, rangeEndErr := convert.ToTime(req.RangeEnd, req.RangeType)
-	if rangeStartErr != nil || rangeEndErr != nil {
-		return nil, tterrors.NewBadRequestError(xerrors.FirstError(rangeStartErr, rangeEndErr))
-	}
-
-	q, err := convert.FromRPCQuery(req.Query)
+	q, opts, err := convert.FromRPCQueryWithOptions(req)
 	if err != nil {
 		return nil, convert.ToRPCError(err)
 	}
 
 	nsID := s.pools.id.GetStringID(ctx, req.NameSpace)
-	opts := index.QueryOptions{
-		StartInclusive: start,
-		EndExclusive:   end,
+
+	if opts.QueryMetadataOptions.Cardinality {
+		s.logger.Info("issuing cardinality query", zap.Stringer("query", q))
+		queryMetadataResult, err := db.QueryMetadata(ctx, nsID, index.Query{Query: q}, opts)
+		if err != nil {
+			return nil, convert.ToRPCError(err)
+		}
+
+		seriesMap := map[string]*rpc.QueryResultElement{}
+		builder := strings.Builder{}
+		for _, results := range queryMetadataResult.Results.Map() {
+
+			for _, aggregateResult := range results.Results {
+				builder.Reset()
+				builder.Write(doc.IDReservedCardinalitySeriesID)
+				builder.WriteString("+")
+				tags := make([]*rpc.Tag, 0, len(aggregateResult.GroupedBy))
+				for i, field := range aggregateResult.GroupedBy {
+					builder.Write(field.Name)
+					builder.WriteString("=")
+					builder.Write(field.Value)
+					if i < len(aggregateResult.GroupedBy)-1 {
+						builder.WriteString(",")
+					}
+					tags = append(tags, &rpc.Tag{
+						Name:  string(field.Name),
+						Value: string(field.Value),
+					})
+				}
+
+				seriesID := builder.String()
+				resultElem, ok := seriesMap[seriesID]
+				if !ok {
+					resultElem = &rpc.QueryResultElement{
+						ID:         seriesID,
+						Tags:       tags,
+						Datapoints: make([]*rpc.Datapoint, 0, len(queryMetadataResult.Results.Map())),
+					}
+					seriesMap[seriesID] = resultElem
+				}
+
+				resultElem.Datapoints = append(resultElem.Datapoints, &rpc.Datapoint{
+					Timestamp:         results.BlockStart.Seconds(),
+					Value:             float64(aggregateResult.EstimateCardinality),
+					TimestampTimeType: rpc.TimeType_UNIX_SECONDS,
+				})
+
+			}
+		}
+
+		result := &rpc.QueryResult_{
+			Results:    make([]*rpc.QueryResultElement, 0, len(seriesMap)),
+			Exhaustive: opts.RequireExhaustive,
+		}
+
+		for _, element := range seriesMap {
+			result.Results = append(result.Results, element)
+		}
+		return result, nil
 	}
-	if l := req.Limit; l != nil {
-		opts.SeriesLimit = int(*l)
-	}
-	if len(req.Source) > 0 {
-		opts.Source = req.Source
-	}
+
 	queryResult, err := db.QueryIDs(ctx, nsID, index.Query{Query: q}, opts)
 	if err != nil {
 		return nil, convert.ToRPCError(err)
@@ -563,7 +623,7 @@ func (s *service) query(ctx context.Context, db storage.Database, req *rpc.Query
 			continue
 		}
 		id.Reset(entry.Key())
-		datapoints, err := s.readDatapoints(ctx, db, nsID, id, start, end,
+		datapoints, err := s.readDatapoints(ctx, db, nsID, id, opts.StartInclusive, opts.EndExclusive,
 			req.ResultTimeType)
 		if err != nil {
 			return nil, convert.ToRPCError(err)
@@ -834,33 +894,57 @@ func (s *service) fetchTaggedIter(
 		return nil, tterrors.NewBadRequestError(err)
 	}
 
-	queryResult, err := db.QueryIDs(ctx, ns, query, opts)
-	if err != nil {
-		return nil, convert.ToRPCError(err)
-	}
-
-	permits, err := s.seriesReadPermits.NewPermits(ctx)
-	if err != nil {
-		return nil, convert.ToRPCError(err)
-	}
-
 	tagEncoder := s.pools.tagEncoder.Get()
 	ctx.RegisterFinalizer(tagEncoder)
 
-	return newFetchTaggedResultsIter(fetchTaggedResultsIterOpts{
-		queryResult:     queryResult,
-		queryOpts:       opts,
-		fetchData:       fetchData,
-		db:              db,
-		docReader:       docs.NewEncodedDocumentReader(),
-		nsID:            ns,
-		tagEncoder:      tagEncoder,
-		iOpts:           s.opts.InstrumentOptions(),
-		instrumentClose: instrumentClose,
-		blockPermits:    permits,
-		requireNoWait:   req.RequireNoWait,
-		indexWaited:     queryResult.Waited,
-	}), nil
+	if opts.QueryMetadataOptions.Cardinality {
+		queryMetadataResult, err := db.QueryMetadata(ctx, ns, query, opts)
+		if err != nil {
+			return nil, convert.ToRPCError(err)
+		}
+		blockSize := db.Options().SeriesOptions().RetentionOptions().BlockSize()
+		// TODO short-circuit query with results
+		s.logger.Info("got cardinality query result",
+			zap.Stringer("query", query),
+			zap.Int("blocks", len(queryMetadataResult.Results.Map())))
+
+		return newFetchTaggedIndexResultsIter(
+			ns,
+			queryMetadataResult,
+			opts,
+			tagEncoder,
+			s.pools.encoder,
+			s.opts.InstrumentOptions(),
+			instrumentClose,
+			blockSize,
+		), nil
+	} else {
+		queryResult, err := db.QueryIDs(ctx, ns, query, opts)
+		if err != nil {
+			return nil, convert.ToRPCError(err)
+		}
+		permits, err := s.seriesReadPermits.NewPermits(ctx)
+		if err != nil {
+			return nil, convert.ToRPCError(err)
+		}
+
+		return newFetchTaggedResultsIter(
+			fetchTaggedResultsIterOpts{
+				queryResult:     queryResult,
+				queryOpts:       opts,
+				fetchData:       fetchData,
+				db:              db,
+				docReader:       docs.NewEncodedDocumentReader(),
+				nsID:            ns,
+				tagEncoder:      tagEncoder,
+				iOpts:           s.opts.InstrumentOptions(),
+				instrumentClose: instrumentClose,
+				blockPermits:    permits,
+				requireNoWait:   req.RequireNoWait,
+				indexWaited:     queryResult.Waited,
+			},
+		), nil
+	}
 }
 
 // FetchTaggedResultsIter iterates over the results from FetchTagged
@@ -926,7 +1010,7 @@ type fetchTaggedResultsIterOpts struct {
 	indexWaited     int
 }
 
-func newFetchTaggedResultsIter(opts fetchTaggedResultsIterOpts) FetchTaggedResultsIter { //nolint: gocritic
+func newFetchTaggedResultsIter(opts fetchTaggedResultsIterOpts) FetchTaggedResultsIter { // nolint: gocritic
 	return &fetchTaggedResultsIter{
 		fetchTaggedResultsIterOpts: opts,
 		idResults:                  make([]idResult, 0, opts.queryResult.Results.Map().Len()),
@@ -1100,6 +1184,130 @@ func (i *fetchTaggedResultsIter) Close(err error) {
 	i.blockPermits.Close()
 }
 
+type fetchTaggedIndexResultsIter struct {
+	ix              int
+	ns              ident.ID
+	cur             IDResult
+	queryOpts       index.QueryOptions
+	err             error
+	instrumentClose func(error)
+	result          index.QueryMetadataResult
+	results         []IDResult
+}
+
+func newFetchTaggedIndexResultsIter(
+	ns ident.ID,
+	result index.QueryMetadataResult,
+	queryOpts index.QueryOptions,
+	tagEncoder serialize.TagEncoder,
+	encoderPool encoding.EncoderPool,
+	iOpts instrument.Options,
+	instrumentClose func(error),
+	blockSize time.Duration,
+) *fetchTaggedIndexResultsIter {
+	resultMap := result.Results.Map()
+	seriesMap := map[string]*idIndexResult{}
+
+	// TODO: take into account groupBy tags
+	builder := strings.Builder{}
+	for _, entry := range resultMap {
+		for _, result := range entry.Results {
+			// inline for now, extract later into separate method
+			builder.Reset()
+			builder.Write(doc.IDReservedCardinalitySeriesID)
+			builder.WriteString("+")
+			for i, field := range result.GroupedBy {
+				builder.Write(field.Name)
+				builder.WriteString("=")
+				builder.Write(field.Value)
+				if i < len(result.GroupedBy)-1 {
+					builder.WriteString(",")
+				}
+			}
+			seriesID := builder.String()
+
+			dp := ts.Datapoint{
+				TimestampNanos: entry.BlockStart,
+				Value:          float64(result.EstimateCardinality),
+			}
+
+			idResult, ok := seriesMap[seriesID]
+			if !ok {
+				metadata := doc.Metadata{
+					ID:     []byte(seriesID),
+					Fields: result.GroupedBy,
+				}
+				idResult = &idIndexResult{
+					metadata:    metadata,
+					encoderPool: encoderPool,
+					iOpts:       iOpts,
+					tagEncoder:  tagEncoder,
+					blockSize:   blockSize,
+					datapoints:  make([]ts.Datapoint, 0, len(resultMap)),
+				}
+				seriesMap[seriesID] = idResult
+			}
+			idResult.datapoints = append(idResult.datapoints, dp)
+		}
+	}
+
+	iter := &fetchTaggedIndexResultsIter{
+		result:          result,
+		ns:              ns,
+		queryOpts:       queryOpts,
+		cur:             nil,
+		instrumentClose: instrumentClose,
+	}
+
+	iter.results = make([]IDResult, 0, len(seriesMap))
+	for _, seriesResult := range seriesMap {
+		iter.results = append(iter.results, seriesResult)
+	}
+	return iter
+}
+
+func (i *fetchTaggedIndexResultsIter) NumIDs() int {
+	return len(i.results)
+}
+
+func (i *fetchTaggedIndexResultsIter) Exhaustive() bool {
+	return i.queryOpts.RequireExhaustive
+}
+
+func (i *fetchTaggedIndexResultsIter) WaitedIndex() int {
+	return 0
+}
+
+func (i *fetchTaggedIndexResultsIter) WaitedSeriesRead() int {
+	return 0
+}
+
+func (i *fetchTaggedIndexResultsIter) Namespace() ident.ID {
+	return i.ns
+}
+
+func (i *fetchTaggedIndexResultsIter) Next(ctx context.Context) bool {
+	if len(i.results) > i.ix {
+		i.cur = i.results[i.ix]
+		i.ix++
+		return true
+	}
+	i.ix++
+	return false
+}
+
+func (i *fetchTaggedIndexResultsIter) Err() error {
+	return i.err
+}
+
+func (i *fetchTaggedIndexResultsIter) Current() IDResult {
+	return i.cur
+}
+
+func (i *fetchTaggedIndexResultsIter) Close(err error) {
+	i.instrumentClose(err)
+}
+
 // IDResult is the FetchTagged result for a series ID.
 type IDResult interface {
 	// ID returns the series ID.
@@ -1158,7 +1366,69 @@ func (i *idResult) WriteSegments(ctx context.Context, dst []*rpc.Segments) ([]*r
 	return dst, nil
 }
 
-func (s *service) Aggregate(tctx thrift.Context, req *rpc.AggregateQueryRequest) (*rpc.AggregateQueryResult_, error) {
+type idIndexResult struct {
+	metadata    doc.Metadata
+	datapoints  []ts.Datapoint
+	iOpts       instrument.Options
+	tagEncoder  serialize.TagEncoder
+	blockSize   time.Duration
+	encoderPool encoding.EncoderPool
+}
+
+func (i *idIndexResult) ID() []byte {
+	return i.metadata.ID
+}
+
+func (i *idIndexResult) WriteTags(dst []byte) ([]byte, error) {
+	tags := idxconvert.ToSeriesTags(i.metadata, idxconvert.Opts{NoClone: true})
+	encodedTags, err := encodeTags(i.tagEncoder, tags, i.iOpts)
+	if err != nil { // This is an invariant, should never happen
+		return nil, tterrors.NewInternalError(err)
+	}
+	dst = append(dst[:0], encodedTags.Bytes()...)
+	i.tagEncoder.Reset()
+	return dst, nil
+}
+
+func (i *idIndexResult) WriteSegments(ctx context.Context, dst []*rpc.Segments) (
+	[]*rpc.Segments,
+	error,
+) {
+	dst = dst[:0]
+	if len(i.datapoints) == 0 {
+		return dst, nil
+	}
+
+	startTime := i.datapoints[0].TimestampNanos
+	enc := i.encoderPool.Get()
+	enc.Reset(startTime, len(i.datapoints), nil)
+	for _, datapoint := range i.datapoints {
+		if err := enc.Encode(datapoint, xtime.Second, nil); err != nil {
+			enc.Close()
+			return nil, err
+		}
+	}
+
+	segment := enc.Discard()
+	blockChecksum := int64(segment.CalculateChecksum())
+	blockSize := xtime.ToNormalizedDuration(i.blockSize, time.Nanosecond)
+	start := int64(startTime)
+	s := &rpc.Segments{}
+	s.Merged = &rpc.Segment{
+		Head:      segment.Head.Bytes(),
+		Tail:      segment.Tail.Bytes(),
+		StartTime: &start,
+		BlockSize: &blockSize,
+		Checksum:  &blockChecksum,
+	}
+	dst = append(dst, s)
+	return dst, nil
+}
+
+func (s *service) Aggregate(
+	tctx thrift.Context,
+	req *rpc.AggregateQueryRequest,
+) (*rpc.AggregateQueryResult_, error) {
 	db, err := s.startReadRPCWithDB()
 	if err != nil {
 		return nil, err

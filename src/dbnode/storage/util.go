@@ -21,6 +21,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"sync"
 	"time"
 
@@ -134,4 +135,10 @@ func filterTimes(times []xtime.UnixNano, predicate func(t xtime.UnixNano) bool) 
 	}
 
 	return filtered
+}
+
+func ShardIDToBytes(shardID uint32) []byte {
+	result := make([]byte, 4)
+	binary.LittleEndian.PutUint32(result, shardID)
+	return result
 }

@@ -25,6 +25,8 @@ import (
 	"sort"
 	"time"
 
+	opentracinglog "github.com/opentracing/opentracing-go/log"
+
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/storage/index/compaction"
@@ -41,8 +43,6 @@ import (
 	"github.com/m3db/m3/src/x/mmap"
 	"github.com/m3db/m3/src/x/pool"
 	xtime "github.com/m3db/m3/src/x/time"
-
-	opentracinglog "github.com/opentracing/opentracing-go/log"
 )
 
 var (
@@ -94,6 +94,8 @@ type QueryOptions struct {
 	RequireNoWait bool
 	// IterationOptions controls additional iteration methods.
 	IterationOptions IterationOptions
+	// QueryMetadataOptions controls additional querying features.
+	QueryMetadataOptions QueryMetadataOptions
 	// Source is an optional query source.
 	Source []byte
 }
@@ -131,6 +133,11 @@ type AggregationOptions struct {
 	Type AggregationType
 }
 
+// QueryMetadataOptions defines custom query metadata features.
+type QueryMetadataOptions struct {
+	Cardinality bool
+}
+
 // QueryResult is the collection of results for a query.
 type QueryResult struct {
 	// Results are index query results.
@@ -158,15 +165,6 @@ type BaseResults interface {
 	// Namespace returns the namespace associated with the result.
 	Namespace() ident.ID
 
-	// Size returns the number of IDs tracked.
-	Size() int
-
-	// TotalDocsCount returns the total number of documents observed.
-	TotalDocsCount() int
-
-	// EnforceLimits returns whether this should enforce and increment limits.
-	EnforceLimits() bool
-
 	// Finalize releases any resources held by the Results object,
 	// including returning it to a backing pool.
 	Finalize()
@@ -177,6 +175,7 @@ type BaseResults interface {
 // as documented by the methods.
 type DocumentResults interface {
 	BaseResults
+	LimitableResults
 
 	// AddDocuments adds the batch of documents to the results set, it will
 	// take a copy of the bytes backing the documents so the original can be
@@ -241,6 +240,33 @@ type QueryResultsOptions struct {
 	IndexBatchCollector chan<- ident.IDBatch
 }
 
+type QueryMetadataResult struct {
+	Results QueryMetadataResults
+}
+
+// QueryMetadataResults is metadata about a set of results for a query
+// on a per-block basis.
+type QueryMetadataResults interface {
+	BaseResults
+
+	AddQueryMetadataResult(blockStart xtime.UnixNano, result QueryMetadataAggregateResult)
+
+	// Map returns the results map from block start -> query metadata per block.
+	Map() map[xtime.UnixNano]QueryMetadataBlockResults
+
+	Shards() []uint32
+}
+
+type QueryMetadataBlockResults struct {
+	BlockStart xtime.UnixNano
+	Results    []QueryMetadataAggregateResult
+}
+
+type QueryMetadataAggregateResult struct {
+	GroupedBy           []doc.Field
+	EstimateCardinality uint64
+}
+
 // QueryResultsAllocator allocates QueryResults types.
 type QueryResultsAllocator func() QueryResults
 
@@ -261,6 +287,7 @@ type QueryResultsPool interface {
 // methods.
 type AggregateResults interface {
 	BaseResults
+	LimitableResults
 
 	// Reset resets the AggregateResults object to initial state.
 	Reset(
@@ -285,6 +312,17 @@ type AggregateResults interface {
 	// mutates the state of the results after obtaining a reference to the map
 	// with this call.
 	Map() *AggregateResultsMap
+}
+
+type LimitableResults interface {
+	// Size returns the number of IDs tracked.
+	Size() int
+
+	// TotalDocsCount returns the total number of documents observed.
+	TotalDocsCount() int
+
+	// EnforceLimits returns whether this should enforce and increment limits.
+	EnforceLimits() bool
 }
 
 // AggregateFieldFilter dictates which fields will appear in the aggregated
@@ -391,6 +429,9 @@ type Block interface {
 
 	// QueryIter returns a new QueryIterator for the query.
 	QueryIter(ctx context.Context, query Query) (QueryIterator, error)
+
+	// QueryMetadataIter returns a new QueryMetadataIterator for the query.
+	QueryMetadataIter(ctx context.Context, query Query, baseResults BaseResults) (QueryMetadataIterator, error)
 
 	// AggregateWithIter aggregates N known tag names/values from the iterator.
 	AggregateWithIter(
@@ -586,6 +627,7 @@ const (
 type WriteBatchOptions struct {
 	InitialCapacity int
 	IndexBlockSize  time.Duration
+	Shard           []byte
 }
 
 // NewWriteBatch creates a new write batch.
@@ -931,6 +973,14 @@ type QueryIterator interface {
 
 	// Current returns the current (field, term).
 	Current() doc.Document
+}
+
+// QueryMetadataIterator iterates through the metadata for a block.
+type QueryMetadataIterator interface {
+	ResultIterator
+
+	// Current returns the current (field, term).
+	Current() QueryMetadataAggregateResult
 }
 
 // AggregateIterator iterates through the (field,term)s for a block.

@@ -61,6 +61,8 @@ type Iterator interface {
 	// should copy the Document if they need it live longer.
 	Current() Document
 
+	EstimateCardinality() uint64
+
 	// Err returns any errors encountered during iteration.
 	Err() error
 

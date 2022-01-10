@@ -163,6 +163,14 @@ type Database interface {
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
 
+	// QueryMetadata resolves the given query into metadata results.
+	QueryMetadata(
+		ctx context.Context,
+		namespace ident.ID,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
+
 	// AggregateQuery resolves the given query into aggregated tags.
 	AggregateQuery(
 		ctx context.Context,
@@ -385,6 +393,13 @@ type databaseNamespace interface {
 		query index.Query,
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
+
+	// QueryMetadata resolves the given metadata query into known IDs.
+	QueryMetadata(
+		ctx context.Context,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
 
 	// AggregateQuery resolves the given query into aggregated tags.
 	AggregateQuery(
@@ -727,6 +742,13 @@ type NamespaceIndex interface {
 		query index.Query,
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
+
+	// QueryMetadata resolves the given query metadata into metadata results.
+	QueryMetadata(
+		ctx context.Context,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
 
 	// WideQuery resolves the given query into known IDs.
 	WideQuery(

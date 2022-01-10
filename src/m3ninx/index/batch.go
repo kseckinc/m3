@@ -38,6 +38,7 @@ var (
 type Batch struct {
 	Docs []doc.Metadata
 
+	ShardID []byte
 	// If AllowPartialUpdates is true the index will continue to index documents in the batch
 	// even if it encounters an error attempting to index a previous document in the batch.
 	// If false, on the other hand, then any errors encountered indexing a document will cause
