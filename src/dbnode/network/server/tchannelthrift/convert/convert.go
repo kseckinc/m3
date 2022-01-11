@@ -124,7 +124,7 @@ type ToSegmentsResult struct {
 }
 
 // ToSegments converts a list of blocks to segments.
-func ToSegments(ctx context.Context, blocks []xio.BlockReader) (ToSegmentsResult, error) { //nolint: gocyclo
+func ToSegments(ctx context.Context, blocks []xio.BlockReader) (ToSegmentsResult, error) { // nolint: gocyclo
 	if len(blocks) == 0 {
 		return ToSegmentsResult{}, nil
 	}
@@ -264,9 +264,15 @@ func FromRPCFetchTaggedRequest(
 		opts.Source = req.Source
 	}
 
-	q, err := idx.Unmarshal(req.Query)
+	q, metadata, err := idx.UnmarshalWithMetadata(req.Query)
 	if err != nil {
 		return nil, index.Query{}, index.QueryOptions{}, false, err
+	}
+
+	for _, value := range metadata {
+		if value == "cardinality" {
+			opts.MetadataOptions.Cardinality = true
+		}
 	}
 
 	var ns ident.ID

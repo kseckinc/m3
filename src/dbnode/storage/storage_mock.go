@@ -379,6 +379,21 @@ func (mr *MockDatabaseMockRecorder) QueryIDs(ctx, namespace, query, opts interfa
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryIDs", reflect.TypeOf((*MockDatabase)(nil).QueryIDs), ctx, namespace, query, opts)
 }
 
+// QueryMetadata mocks base method.
+func (m *MockDatabase) QueryMetadata(ctx context.Context, ns ident.ID, query index.Query, opts index.QueryOptions) (index.QueryMetadataResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryMetadata", ctx, ns, query, opts)
+	ret0, _ := ret[0].(index.QueryMetadataResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// QueryMetadata indicates an expected call of QueryMetadata.
+func (mr *MockDatabaseMockRecorder) QueryMetadata(ctx, ns, query, opts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryMetadata", reflect.TypeOf((*MockDatabase)(nil).QueryMetadata), ctx, ns, query, opts)
+}
+
 // ReadEncoded mocks base method.
 func (m *MockDatabase) ReadEncoded(ctx context.Context, namespace, id ident.ID, start, end time0.UnixNano) (series.BlockReaderIter, error) {
 	m.ctrl.T.Helper()
@@ -802,6 +817,21 @@ func (m *Mockdatabase) QueryIDs(ctx context.Context, namespace ident.ID, query i
 func (mr *MockdatabaseMockRecorder) QueryIDs(ctx, namespace, query, opts interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryIDs", reflect.TypeOf((*Mockdatabase)(nil).QueryIDs), ctx, namespace, query, opts)
+}
+
+// QueryMetadata mocks base method.
+func (m *Mockdatabase) QueryMetadata(ctx context.Context, ns ident.ID, query index.Query, opts index.QueryOptions) (index.QueryMetadataResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryMetadata", ctx, ns, query, opts)
+	ret0, _ := ret[0].(index.QueryMetadataResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// QueryMetadata indicates an expected call of QueryMetadata.
+func (mr *MockdatabaseMockRecorder) QueryMetadata(ctx, ns, query, opts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryMetadata", reflect.TypeOf((*Mockdatabase)(nil).QueryMetadata), ctx, ns, query, opts)
 }
 
 // ReadEncoded mocks base method.
@@ -1479,6 +1509,21 @@ func (m *MockdatabaseNamespace) QueryIDs(ctx context.Context, query index.Query,
 func (mr *MockdatabaseNamespaceMockRecorder) QueryIDs(ctx, query, opts interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryIDs", reflect.TypeOf((*MockdatabaseNamespace)(nil).QueryIDs), ctx, query, opts)
+}
+
+// QueryMetadata mocks base method.
+func (m *MockdatabaseNamespace) QueryMetadata(ctx context.Context, query index.Query, opts index.QueryOptions) (index.QueryMetadataResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryMetadata", ctx, query, opts)
+	ret0, _ := ret[0].(index.QueryMetadataResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// QueryMetadata indicates an expected call of QueryMetadata.
+func (mr *MockdatabaseNamespaceMockRecorder) QueryMetadata(ctx, query, opts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryMetadata", reflect.TypeOf((*MockdatabaseNamespace)(nil).QueryMetadata), ctx, query, opts)
 }
 
 // ReadEncoded mocks base method.
@@ -2574,6 +2619,21 @@ func (m *MockNamespaceIndex) Query(ctx context.Context, query index.Query, opts 
 func (mr *MockNamespaceIndexMockRecorder) Query(ctx, query, opts interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Query", reflect.TypeOf((*MockNamespaceIndex)(nil).Query), ctx, query, opts)
+}
+
+// QueryMetadata mocks base method.
+func (m *MockNamespaceIndex) QueryMetadata(ctx context.Context, query index.Query, opts index.QueryOptions) (index.QueryMetadataResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryMetadata", ctx, query, opts)
+	ret0, _ := ret[0].(index.QueryMetadataResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// QueryMetadata indicates an expected call of QueryMetadata.
+func (mr *MockNamespaceIndexMockRecorder) QueryMetadata(ctx, query, opts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryMetadata", reflect.TypeOf((*MockNamespaceIndex)(nil).QueryMetadata), ctx, query, opts)
 }
 
 // Tick mocks base method.

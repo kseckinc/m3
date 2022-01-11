@@ -25,7 +25,10 @@ import (
 	"sort"
 	"time"
 
+	opentracinglog "github.com/opentracing/opentracing-go/log"
+
 	"github.com/m3db/m3/src/dbnode/encoding"
+	"github.com/m3db/m3/src/dbnode/sharding"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/storage/index/compaction"
 	"github.com/m3db/m3/src/dbnode/storage/limits"
@@ -41,8 +44,6 @@ import (
 	"github.com/m3db/m3/src/x/mmap"
 	"github.com/m3db/m3/src/x/pool"
 	xtime "github.com/m3db/m3/src/x/time"
-
-	opentracinglog "github.com/opentracing/opentracing-go/log"
 )
 
 // InsertMode specifies whether inserts are synchronous or asynchronous.
@@ -90,6 +91,8 @@ type QueryOptions struct {
 	IterationOptions IterationOptions
 	// Source is an optional query source.
 	Source []byte
+	// MetatadaOptions represents query metadata options.
+	MetadataOptions QueryMetadataOptions
 }
 
 // IterationOptions enables users to specify iteration preferences.
@@ -98,6 +101,12 @@ type IterationOptions struct {
 	SeriesIteratorConsolidator encoding.SeriesIteratorConsolidator
 	// IterateEqualTimestampStrategy provides the conflict resolution strategy for the same timestamp.
 	IterateEqualTimestampStrategy encoding.IterateEqualTimestampStrategy
+}
+
+// QueryMetadataOptions specifies query metadata.
+type QueryMetadataOptions struct {
+	// Cardinality indicates that custom cardinality query was issued.
+	Cardinality bool
 }
 
 // AggregationOptions enables users to specify constraints on aggregations.
@@ -119,6 +128,39 @@ type QueryResult struct {
 	Waited int
 }
 
+// QueryMetadataResult is the collection of metadata results for a query.
+type QueryMetadataResult struct {
+	// Results are index query metadata results.
+	Results QueryMetadataResults
+}
+
+// QueryMetadataResults is metadata about a set of results for a query
+// on a per-block basis.
+type QueryMetadataResults interface {
+	BaseResults
+
+	// AddQueryMetadataResult adds block's result to metadata results.
+	AddQueryMetadataResult(blockStart xtime.UnixNano, result QueryMetadataAggregateResult)
+
+	// Map returns the results map from block start -> query metadata per block.
+	Map() map[xtime.UnixNano]QueryMetadataBlockResults
+
+	// HashFn returns shard hash function to compute shardIDs.
+	HashFn() sharding.HashFn
+}
+
+// QueryMetadataBlockResults represents results per one index block.
+type QueryMetadataBlockResults struct {
+	BlockStart xtime.UnixNano
+	Results    []QueryMetadataAggregateResult
+}
+
+// QueryMetadataAggregateResult represents query metadata aggregate result.
+type QueryMetadataAggregateResult struct {
+	GroupedBy           []doc.Field
+	EstimateCardinality uint64
+}
+
 // AggregateQueryResult is the collection of results for an aggregate query.
 type AggregateQueryResult struct {
 	// Results are aggregate index query results.
@@ -136,15 +178,6 @@ type BaseResults interface {
 	// Namespace returns the namespace associated with the result.
 	Namespace() ident.ID
 
-	// Size returns the number of IDs tracked.
-	Size() int
-
-	// TotalDocsCount returns the total number of documents observed.
-	TotalDocsCount() int
-
-	// EnforceLimits returns whether this should enforce and increment limits.
-	EnforceLimits() bool
-
 	// Finalize releases any resources held by the Results object,
 	// including returning it to a backing pool.
 	Finalize()
@@ -155,6 +188,7 @@ type BaseResults interface {
 // as documented by the methods.
 type DocumentResults interface {
 	BaseResults
+	LimitableResults
 
 	// AddDocuments adds the batch of documents to the results set, it will
 	// take a copy of the bytes backing the documents so the original can be
@@ -163,6 +197,18 @@ type DocumentResults interface {
 	// mutable and the most recent need to shadow older entries.
 
 	AddDocuments(batch []doc.Document) (size, docsCount int, err error)
+}
+
+// LimitableResults represents limitable results.
+type LimitableResults interface {
+	// Size returns the number of IDs tracked.
+	Size() int
+
+	// TotalDocsCount returns the total number of documents observed.
+	TotalDocsCount() int
+
+	// EnforceLimits returns whether this should enforce and increment limits.
+	EnforceLimits() bool
 }
 
 // ResultDurations holds various timing information for a query result.
@@ -238,6 +284,7 @@ type QueryResultsPool interface {
 // methods.
 type AggregateResults interface {
 	BaseResults
+	LimitableResults
 
 	// Reset resets the AggregateResults object to initial state.
 	Reset(
@@ -368,6 +415,13 @@ type Block interface {
 
 	// QueryIter returns a new QueryIterator for the query.
 	QueryIter(ctx context.Context, query Query) (QueryIterator, error)
+
+	// QueryMetadataIter returns a new QueryMetadataIterator for the query.
+	QueryMetadataIter(
+		ctx context.Context,
+		query Query,
+		baseResults BaseResults,
+	) (QueryMetadataIterator, error)
 
 	// AggregateWithIter aggregates N known tag names/values from the iterator.
 	AggregateWithIter(
@@ -942,6 +996,14 @@ type ResultIterator interface {
 
 	// Counts returns the number of series and documents processed by the iterator.
 	Counts() (series, docs int)
+}
+
+// QueryMetadataIterator iterates through the metadata for a block.
+type QueryMetadataIterator interface {
+	ResultIterator
+
+	// Current returns the current (field, term).
+	Current() QueryMetadataAggregateResult
 }
 
 // fieldsAndTermsIterator iterates over all known fields and terms for a segment.

@@ -28,6 +28,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	opentracinglog "github.com/opentracing/opentracing-go/log"
+	"github.com/uber-go/tally"
+	"go.uber.org/zap"
+
 	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/generated/proto/annotation"
 	"github.com/m3db/m3/src/dbnode/namespace"
@@ -49,10 +53,6 @@ import (
 	"github.com/m3db/m3/src/x/instrument"
 	xopentracing "github.com/m3db/m3/src/x/opentracing"
 	xtime "github.com/m3db/m3/src/x/time"
-
-	opentracinglog "github.com/opentracing/opentracing-go/log"
-	"github.com/uber-go/tally"
-	"go.uber.org/zap"
 )
 
 const (
@@ -136,6 +136,7 @@ type databaseMetrics struct {
 	unknownNamespaceFetchBlocks         tally.Counter
 	unknownNamespaceFetchBlocksMetadata tally.Counter
 	unknownNamespaceQueryIDs            tally.Counter
+	unknownNamespaceQueryMetadata       tally.Counter
 	errQueryIDsIndexDisabled            tally.Counter
 	errWriteTaggedIndexDisabled         tally.Counter
 	pendingNamespaceChange              tally.Gauge
@@ -154,6 +155,7 @@ func newDatabaseMetrics(scope tally.Scope) databaseMetrics {
 		unknownNamespaceFetchBlocks:         unknownNamespaceScope.Counter("fetch-blocks"),
 		unknownNamespaceFetchBlocksMetadata: unknownNamespaceScope.Counter("fetch-blocks-metadata"),
 		unknownNamespaceQueryIDs:            unknownNamespaceScope.Counter("query-ids"),
+		unknownNamespaceQueryMetadata:       unknownNamespaceScope.Counter("query-metadata"),
 		errQueryIDsIndexDisabled:            indexDisabledScope.Counter("err-query-ids"),
 		errWriteTaggedIndexDisabled:         indexDisabledScope.Counter("err-write-tagged"),
 		pendingNamespaceChange:              scope.Gauge("pending-namespace-change"),
@@ -1015,6 +1017,41 @@ func (d *db) QueryIDs(
 	}
 
 	return n.QueryIDs(ctx, query, opts)
+}
+
+// nolint: dupl
+func (d *db) QueryMetadata(
+	ctx context.Context,
+	namespace ident.ID,
+	query index.Query,
+	opts index.QueryOptions,
+) (index.QueryMetadataResult, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBQueryMetadata)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("query", query.String()),
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Int("seriesLimit", opts.SeriesLimit),
+			opentracinglog.Int("docsLimit", opts.DocsLimit),
+			xopentracing.Time("start", opts.StartInclusive.ToTime()),
+			xopentracing.Time("end", opts.EndExclusive.ToTime()),
+		)
+	}
+	defer sp.Finish()
+
+	// Check if exceeding query limits at very beginning of
+	// query path to abandon as early as possible.
+	if err := d.queryLimits.AnyFetchExceeded(); err != nil {
+		return index.QueryMetadataResult{}, err
+	}
+
+	n, err := d.namespaceFor(namespace)
+	if err != nil {
+		sp.LogFields(opentracinglog.Error(err))
+		d.metrics.unknownNamespaceQueryMetadata.Inc(1)
+		return index.QueryMetadataResult{}, err
+	}
+	return n.QueryMetadata(ctx, query, opts)
 }
 
 func (d *db) AggregateQuery(

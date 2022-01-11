@@ -34,8 +34,14 @@ var (
 	ErrEmptyDocument = errors.New("document cannot be empty")
 )
 
-// IDReservedFieldName is the field name reserved for IDs.
-var IDReservedFieldName = []byte("_m3ninx_id")
+var (
+	// IDReservedFieldName is the field name reserved for IDs.
+	IDReservedFieldName = []byte("_m3ninx_id")
+	// IDReservedShardIDFieldName is the field name reserved for shardIDs.
+	IDReservedShardIDFieldName = []byte("_shard_id")
+	// IDReservedCardinalitySeriesID is the seriesID reserved for cardinality query.
+	IDReservedCardinalitySeriesID = []byte("cardinality")
+)
 
 // Field represents a field in a document. It is composed of a name and a value.
 type Field struct {

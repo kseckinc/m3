@@ -21,6 +21,7 @@
 package query
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -95,4 +96,92 @@ func UnmarshalProto(q *querypb.Query) (search.Query, error) {
 	}
 
 	return nil, fmt.Errorf("unknown query: %+v", q)
+}
+
+const fldMetadata = "__metadata__"
+
+// UnmarshalWithMetadata decodes a query from a byte slice.
+func UnmarshalWithMetadata(data []byte) (search.Query, []string, error) {
+	var pb querypb.Query
+	if err := pb.Unmarshal(data); err != nil {
+		return nil, nil, err
+	}
+
+	var metadata []string
+	query, md, err := UnmarshalProtoMetadata(&pb, metadata)
+	return query, md, err
+}
+
+// UnmarshalProtoMetadata will unmarshal a proto query (will return metadata values if found).
+func UnmarshalProtoMetadata(q *querypb.Query, metadata []string) (search.Query, []string, error) {
+	switch q := q.Query.(type) {
+
+	case *querypb.Query_All:
+		return NewAllQuery(), metadata, nil
+
+	case *querypb.Query_Field:
+		return NewFieldQuery(q.Field.Field), metadata, nil
+
+	case *querypb.Query_Term:
+		if bytes.Equal([]byte(fldMetadata), q.Term.Field) {
+			metadata = append(metadata, string(q.Term.Term))
+			return NewAllQuery(), metadata, nil
+		}
+		return NewTermQuery(q.Term.Field, q.Term.Term), metadata, nil
+
+	case *querypb.Query_Regexp:
+		query, err := NewRegexpQuery(q.Regexp.Field, q.Regexp.Regexp)
+		return query, metadata, err
+
+	case *querypb.Query_Negation:
+		inner, md, err := UnmarshalProtoMetadata(q.Negation.Query, metadata)
+		if err != nil {
+			return nil, nil, err
+		}
+		return NewNegationQuery(inner), md, nil
+
+	case *querypb.Query_Conjunction:
+		qs := make([]search.Query, 0, len(q.Conjunction.Queries))
+		for _, qry := range q.Conjunction.Queries {
+			if term := qry.GetTerm(); term != nil {
+				if bytes.Equal([]byte(fldMetadata), term.Field) {
+					metadata = append(metadata, string(term.Term))
+					continue
+				}
+			}
+			sqry, md, err := UnmarshalProtoMetadata(qry, metadata)
+			if err != nil {
+				return nil, nil, err
+			}
+			metadata = md
+			qs = append(qs, sqry)
+		}
+		if len(qs) == 0 {
+			return NewAllQuery(), metadata, nil
+		}
+		return NewConjunctionQuery(qs), metadata, nil
+
+	case *querypb.Query_Disjunction:
+		qs := make([]search.Query, 0, len(q.Disjunction.Queries))
+		for _, qry := range q.Disjunction.Queries {
+			if term := qry.GetTerm(); term != nil {
+				if bytes.Equal([]byte(fldMetadata), term.Field) {
+					metadata = append(metadata, string(term.Term))
+					continue
+				}
+			}
+			sqry, md, err := UnmarshalProtoMetadata(qry, metadata)
+			if err != nil {
+				return nil, nil, err
+			}
+			metadata = md
+			qs = append(qs, sqry)
+		}
+		if len(qs) == 0 {
+			return NewAllQuery(), metadata, nil
+		}
+		return NewDisjunctionQuery(qs), metadata, nil
+	}
+
+	return nil, metadata, fmt.Errorf("unknown query: %+v", q)
 }

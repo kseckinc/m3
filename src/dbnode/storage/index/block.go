@@ -27,6 +27,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -42,6 +43,7 @@ import (
 	m3ninxindex "github.com/m3db/m3/src/m3ninx/index"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
 	"github.com/m3db/m3/src/m3ninx/index/segment/fst"
+	"github.com/m3db/m3/src/m3ninx/index/segment/fst/encoding/docs"
 	"github.com/m3db/m3/src/m3ninx/persist"
 	"github.com/m3db/m3/src/m3ninx/search"
 	"github.com/m3db/m3/src/m3ninx/search/executor"
@@ -474,6 +476,89 @@ func (b *block) QueryIter(ctx context.Context, query Query) (QueryIterator, erro
 	}))
 
 	return NewQueryIter(docIter), nil
+}
+
+func (b *block) QueryMetadataIter(
+	ctx context.Context,
+	query Query,
+	baseResults BaseResults,
+) (QueryMetadataIterator, error) {
+	b.RLock()
+	defer b.RUnlock()
+
+	if b.state == blockStateClosed {
+		return nil, ErrUnableToQueryBlockClosed
+	}
+
+	exec, err := b.newExecutorWithRLockFn()
+	if err != nil {
+		return nil, err
+	}
+
+	metadataResults, ok := baseResults.(QueryMetadataResults)
+	if !ok {
+		return nil, fmt.Errorf("unknown results type [%T] received during query", baseResults)
+	}
+
+	docIter, err := exec.Execute(ctx, query.SearchQuery())
+	if err != nil {
+		b.closeAsync(exec)
+		return nil, err
+	}
+
+	var (
+		document            doc.Document
+		cardinalityByShards = map[uint32]*uint64{}
+		hashFn              = metadataResults.HashFn()
+	)
+
+	for docIter.Next() {
+		if err := docIter.Err(); err != nil {
+			return nil, fmt.Errorf("docIter error: %w", err)
+		}
+
+		document = docIter.Current()
+		docID, err := docs.ReadIDFromDocument(document)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read ID from document: %w", err)
+		}
+
+		shardID := hashFn(ident.BytesID(docID))
+		cardinality, ok := cardinalityByShards[shardID]
+		if !ok {
+			var initialCardinality uint64 = 1
+			cardinalityByShards[shardID] = &initialCardinality
+		} else {
+			*cardinality++
+		}
+	}
+
+	if err := docIter.Close(); err != nil {
+		b.logger.Error("failed to close docIter", zap.Error(err))
+	}
+
+	results := make([]QueryMetadataAggregateResult, 0, len(cardinalityByShards))
+	for shardID, cardinality := range cardinalityByShards {
+		shardID := strconv.Itoa(int(shardID))
+		results = append(results, QueryMetadataAggregateResult{
+			GroupedBy: []doc.Field{
+				{
+					Name:  doc.IDReservedShardIDFieldName,
+					Value: []byte(shardID),
+				},
+			},
+			EstimateCardinality: *cardinality,
+		})
+	}
+
+	// Register the executor to close when context closes
+	// so can avoid copying the results into the map and just take
+	// references to it.
+	ctx.RegisterFinalizer(xresource.FinalizerFn(func() {
+		b.closeAsync(exec)
+	}))
+
+	return NewQueryMetadataIter(results), nil
 }
 
 // nolint: dupl

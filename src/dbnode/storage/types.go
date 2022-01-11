@@ -159,6 +159,13 @@ type Database interface {
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
 
+	QueryMetadata(
+		ctx context.Context,
+		ns ident.ID,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
+
 	// AggregateQuery resolves the given query into aggregated tags.
 	AggregateQuery(
 		ctx context.Context,
@@ -341,6 +348,13 @@ type databaseNamespace interface {
 		query index.Query,
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
+
+	// QueryMetadata resolves the metadata query into results from the reverse index.
+	QueryMetadata(
+		ctx context.Context,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
 
 	// AggregateQuery resolves the given query into aggregated tags.
 	AggregateQuery(
@@ -673,6 +687,13 @@ type NamespaceIndex interface {
 		query index.Query,
 		opts index.QueryOptions,
 	) (index.QueryResult, error)
+
+	// QueryMetadata resolves the given query metadata into metadata results.
+	QueryMetadata(
+		ctx context.Context,
+		query index.Query,
+		opts index.QueryOptions,
+	) (index.QueryMetadataResult, error)
 
 	// AggregateQuery resolves the given query into aggregated tags.
 	AggregateQuery(

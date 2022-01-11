@@ -32,6 +32,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/m3db/bitset"
+	"github.com/opentracing/opentracing-go"
+	opentracinglog "github.com/opentracing/opentracing-go/log"
+	"github.com/uber-go/tally"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
+
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/persist"
 	"github.com/m3db/m3/src/dbnode/persist/fs"
@@ -64,13 +71,6 @@ import (
 	xopentracing "github.com/m3db/m3/src/x/opentracing"
 	xresource "github.com/m3db/m3/src/x/resource"
 	xtime "github.com/m3db/m3/src/x/time"
-
-	"github.com/m3db/bitset"
-	"github.com/opentracing/opentracing-go"
-	opentracinglog "github.com/opentracing/opentracing-go/log"
-	"github.com/uber-go/tally"
-	"go.uber.org/atomic"
-	"go.uber.org/zap"
 )
 
 var (
@@ -1523,6 +1523,43 @@ func (i *nsIndex) Query(
 	}, nil
 }
 
+func (i *nsIndex) QueryMetadata(
+	ctx context.Context,
+	query index.Query,
+	opts index.QueryOptions,
+) (index.QueryMetadataResult, error) {
+	var logFields []opentracinglog.Field
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.NSIdxQueryMetadata)
+	defer sp.Finish()
+	if sampled {
+		// Only allocate metadata such as query string if sampling trace.
+		logFields = []opentracinglog.Field{
+			opentracinglog.String("query", query.String()),
+			opentracinglog.String("namespace", i.nsMetadata.ID().String()),
+			xopentracing.Time("queryStart", opts.StartInclusive.ToTime()),
+			xopentracing.Time("queryEnd", opts.EndExclusive.ToTime()),
+		}
+		sp.LogFields(logFields...)
+	}
+
+	results := index.NewQueryMetadataResults(i.nsMetadata.ID(), i.shardSet.HashFn())
+	ctx.RegisterFinalizer(results)
+	_, err := i.query(
+		ctx, query, results, opts,
+		i.execBlockQueryMetadataFn,
+		i.newBlockQueryMetadataIterFn,
+		logFields,
+	)
+	if err != nil {
+		sp.LogFields(opentracinglog.Error(err))
+		return index.QueryMetadataResult{}, err
+	}
+
+	return index.QueryMetadataResult{
+		Results: results,
+	}, nil
+}
+
 func (i *nsIndex) AggregateQuery(
 	ctx context.Context,
 	query index.Query,
@@ -1623,9 +1660,9 @@ func (i *nsIndex) query(
 	}
 
 	// If require exhaustive but not, return error.
-	if opts.RequireExhaustive {
-		seriesCount := results.Size()
-		docsCount := results.TotalDocsCount()
+	if limitable, ok := results.(index.LimitableResults); ok && opts.RequireExhaustive {
+		seriesCount := limitable.Size()
+		docsCount := limitable.TotalDocsCount()
 		if opts.SeriesLimitExceeded(seriesCount) {
 			i.metrics.queryNonExhaustiveSeriesLimitError.Inc(1)
 		} else if opts.DocsLimitExceeded(docsCount) {
@@ -1731,7 +1768,14 @@ func (i *nsIndex) queryWithSpan(
 
 	// queryCanceled returns true if the query has been canceled and the current iteration should terminate.
 	queryCanceled := func() bool {
-		return opts.LimitsExceeded(results.Size(), results.TotalDocsCount()) || state.hasErr()
+		if state.hasErr() {
+			return true
+		}
+		limitable, ok := results.(index.LimitableResults)
+		if !ok {
+			return false
+		}
+		return opts.LimitsExceeded(limitable.Size(), limitable.TotalDocsCount())
 	}
 	// waitForPermit waits for a permit. returns non-nil if the permit was acquired and the wait time.
 	waitForPermit := func() (permits.Permit, time.Duration) {
@@ -1830,9 +1874,11 @@ func (i *nsIndex) queryWithSpan(
 	// finish.
 	wg.Wait()
 
-	i.metrics.loadedDocsPerQuery.RecordValue(float64(results.TotalDocsCount()))
-
-	exhaustive := opts.Exhaustive(results.Size(), results.TotalDocsCount())
+	exhaustive := true
+	if limitable, ok := results.(index.LimitableResults); ok {
+		i.metrics.loadedDocsPerQuery.RecordValue(float64(limitable.TotalDocsCount()))
+		exhaustive = opts.Exhaustive(limitable.Size(), limitable.TotalDocsCount())
+	}
 	// ok to read state without lock since all parallel queries are done.
 	multiErr := state.multiErr
 	err = multiErr.FinalError()
@@ -1852,7 +1898,7 @@ func (i *nsIndex) newBlockQueryIterFn(
 	return block.QueryIter(ctx, query)
 }
 
-//nolint: dupl
+// nolint: dupl
 func (i *nsIndex) execBlockQueryFn(
 	ctx context.Context,
 	block index.Block,
@@ -1912,6 +1958,7 @@ func (i *nsIndex) newBlockAggregatorIterFn(
 	return block.AggregateIter(ctx, aggResults.AggregateResultsOptions())
 }
 
+// nolint: dupl
 func (i *nsIndex) execBlockAggregateQueryFn(
 	ctx context.Context,
 	block index.Block,
@@ -1952,6 +1999,77 @@ func (i *nsIndex) execBlockAggregateQueryFn(
 		err = nil
 	}
 
+	if err != nil {
+		sp.LogFields(opentracinglog.Error(err))
+		state.addErr(err)
+	}
+}
+
+func (i *nsIndex) newBlockQueryMetadataIterFn(
+	ctx context.Context,
+	block index.Block,
+	query index.Query,
+	results index.BaseResults,
+) (index.ResultIterator, error) {
+	return block.QueryMetadataIter(ctx, query, results)
+}
+
+// nolint: dupl
+func (i *nsIndex) execBlockQueryMetadataFn(
+	ctx context.Context,
+	block index.Block,
+	permit permits.Permit,
+	iter index.ResultIterator,
+	opts index.QueryOptions,
+	state *asyncQueryExecState,
+	results index.BaseResults,
+	logFields []opentracinglog.Field,
+) {
+	logFields = append(
+		logFields,
+		xopentracing.Time("blockStart", block.StartTime().ToTime()),
+		xopentracing.Time("blockEnd", block.EndTime().ToTime()),
+	)
+
+	ctx, sp := ctx.StartTraceSpan(tracepoint.NSIdxBlockQueryMetadata)
+	sp.LogFields(logFields...)
+	defer sp.Finish()
+
+	metadataResults, ok := results.(index.QueryMetadataResults)
+	if !ok { // should never happen
+		state.addErr(fmt.Errorf("unknown results type [%T] received during query", results))
+		return
+	}
+	queryIter, ok := iter.(index.QueryMetadataIterator)
+	if !ok { // should never happen
+		state.addErr(fmt.Errorf("unknown results type [%T] received during query", iter))
+		return
+	}
+
+	blockStart := block.StartTime()
+	if blockStart == 0 {
+		bs := xtime.ToUnixNano(i.nowFn().Truncate(i.blockSize))
+		if bs.Before(opts.EndExclusive) &&
+			(bs.Equal(opts.StartInclusive) || bs.After(opts.StartInclusive)) {
+			blockStart = bs
+		} else {
+			blockStart = opts.EndExclusive.Add(-1 * time.Second)
+		}
+	}
+	for queryIter.Next(ctx) {
+		queryResult := queryIter.Current()
+		metadataResults.AddQueryMetadataResult(blockStart, queryResult)
+	}
+
+	err := queryIter.Err()
+	if err == index.ErrUnableToQueryBlockClosed {
+		// NB(r): Because we query this block outside of the results lock, it's
+		// possible this block may get closed if it slides out of retention, in
+		// that case those results are no longer considered valid and outside of
+		// retention regardless, so this is a non-issue.
+		err = nil
+	}
+	err = queryIter.Close()
 	if err != nil {
 		sp.LogFields(opentracinglog.Error(err))
 		state.addErr(err)
